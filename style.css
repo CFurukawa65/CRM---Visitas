@@ -35,7 +35,7 @@ main { padding: 10px 12px; max-width: 640px; margin: 0 auto; }
 .exemplo { color: var(--suave); font-size: 13px; margin: 0 0 6px; }
 .atual { color: var(--suave); font-size: 12px; margin-top: 4px; }
 
-input[type=text], input[type=month], input[type=date], input[type=password], input[type=url], select {
+input[type=text], input[type=tel], input[type=time], input[type=month], input[type=date], input[type=password], input[type=url], select {
   width: 100%; min-height: 48px; padding: 8px 12px; font-size: 16px; color: var(--texto);
   background: #fff; border: 1px solid var(--linha); border-radius: 10px;
 }
@@ -102,3 +102,11 @@ details.card[open] > summary { margin-bottom: 8px; }
 .erros { margin: 0; padding-left: 20px; color: var(--alerta); }
 .ajuda { font-size: 13px; color: var(--suave); }
 .vazio { text-align: center; color: var(--suave); padding: 28px 8px; }
+
+/* ---- versão 1.1: lançamento do escritório ---- */
+.check { display: flex; align-items: center; gap: 12px; min-height: 48px; font-weight: 600; }
+.check input[type=checkbox] { width: 26px; height: 26px; flex: none; accent-color: var(--verde); }
+.card.lancamento { border-color: var(--ambar); background: #fffaf0; }
+.card.lancamento h2 { color: var(--ambar); }
+body.modo-escritorio .topo { background: var(--ambar); }
+body.modo-escritorio .pill { background: #8a5200; }

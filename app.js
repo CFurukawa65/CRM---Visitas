@@ -1,5 +1,6 @@
 /* app.js — CRM Visitas · Copasul (PWA, funciona sem sinal)
- * Fluxo: abre → GPS automático → escolhe negócio → grava por voz cada campo → salva → envia quando houver sinal. */
+ * Fluxo: abre → GPS automático → escolhe negócio → grava por voz cada campo → salva → envia quando houver sinal.
+ * Modo "lançamento do escritório" (Config): sem GPS; informa o vendedor e a data real da visita. */
 (function () {
   'use strict';
   const L = window.Logic;
@@ -29,19 +30,22 @@
 
   /* ---------- estado ---------- */
   const S = {
-    vendedor: '', vendedores: [], endpoint: '', token: '',
+    vendedor: '', vendedores: [], endpoint: '', token: '', modoEscritorio: false,
     aba: 'visita', draft: null, registros: [],
     gps: { status: 'idle', best: null, watchId: null, timer: null },
     rec: null, enviando: false, instalar: null, opcionalAberto: false,
   };
-  const novoDraft = () => ({ negocioSel: '', valores: {}, texto: { cliente: '', fazenda: '', municipio: '' }, audios: {}, pdf: null });
+  const novoDraft = () => ({
+    negocioSel: '', valores: {}, texto: { cliente: '', fazenda: '', municipio: '', telefone: '' }, audios: {}, pdf: null,
+    lancandoEm: '', dataVisita: '', horaVisita: '',
+  });
   const temOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 
   /* ---------- configuração local ---------- */
   const CFG_KEY = 'crmcopasul.cfg';
   function lerCfg() { try { return JSON.parse(localStorage.getItem(CFG_KEY) || '{}'); } catch (e) { return {}; } }
   function gravarCfg() {
-    try { localStorage.setItem(CFG_KEY, JSON.stringify({ vendedor: S.vendedor, endpoint: S.endpoint, token: S.token, vendedores: S.vendedores })); } catch (e) { /* sem storage */ }
+    try { localStorage.setItem(CFG_KEY, JSON.stringify({ vendedor: S.vendedor, endpoint: S.endpoint, token: S.token, vendedores: S.vendedores, modoEscritorio: S.modoEscritorio })); } catch (e) { /* sem storage */ }
   }
   const b64uEnc = (s) => btoa(unescape(encodeURIComponent(s))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   const b64uDec = (s) => decodeURIComponent(escape(atob(s.replace(/-/g, '+').replace(/_/g, '/'))));
@@ -136,6 +140,7 @@
   }
   function iniciarGPS() {
     pararGPS();
+    if (S.modoEscritorio) return; // lançamento do escritório não marca ponto
     if (!('geolocation' in navigator)) { S.gps.status = 'indisponivel'; renderGps(); return; }
     S.gps.status = 'buscando';
     S.gps.best = null;
@@ -246,7 +251,7 @@
   }
   const draftTemConteudo = () => {
     const d = S.draft;
-    return Object.keys(d.valores).length || Object.keys(d.audios).length || d.pdf || d.texto.cliente || d.texto.fazenda || d.texto.municipio;
+    return Object.keys(d.valores).length || Object.keys(d.audios).length || d.pdf || d.texto.cliente || d.texto.fazenda || d.texto.municipio || d.texto.telefone;
   };
 
   /* ---------- valores atuais (último estado conhecido do negócio) ---------- */
@@ -273,6 +278,7 @@
     return h('div', { class: 'campo', 'data-campo': def.key },
       h('div', { class: 'rotulo' }, h('span', null, def.rotulo), def.obrigatorio ? h('span', { class: 'obrig' }, 'obrigatório') : null),
       def.tipo === 'voz' && def.exemplo ? h('p', { class: 'exemplo' }, def.exemplo) : null,
+      def.dica ? h('p', { class: 'exemplo' }, def.dica) : null,
       filhos);
   }
 
@@ -358,7 +364,7 @@
         entrada,
         p ? h('span', { class: 'voz-info' }, p.name + ' · ' + L.fmtBytes(p.size)) : null,
         p ? h('button', { class: 'btn pequeno perigo', type: 'button', onclick: () => { S.draft.pdf = null; agendarRascunho(); renderVisita(); } }, 'Remover') : null),
-      h('div', { class: 'ajuda' }, 'Os dados do projeto (pivôs, lances, hectares, valores) são extraídos no escritório.'),
+      h('div', { class: 'ajuda' }, 'Use o nome padrão "Cliente - Fazenda - vNN - data". Os dados do projeto (pivôs, lances, hectares, valores) são lidos no escritório.'),
     ]);
   }
   function onPdf(e) {
@@ -394,11 +400,17 @@
         oninput: (e) => { S.draft.texto[def.key] = e.target.value; agendarRascunho(); } }),
       widgetVoz(def)));
   }
+  /** Telefone: só digitado (teclado numérico), opcional. */
+  function campoTelefone(def) {
+    return envolver(def, h('input', { type: 'tel', inputmode: 'tel', id: 'in-' + def.key, placeholder: def.exemplo, value: S.draft.texto[def.key] || '', autocomplete: 'off', 'aria-label': def.rotulo,
+      oninput: (e) => { S.draft.texto[def.key] = e.target.value; agendarRascunho(); } }));
+  }
 
   function renderCampo(def, ef, atual) {
     switch (def.tipo) {
       case 'voz': return campoVoz(def);
       case 'texto_voz': return campoTextoVoz(def);
+      case 'telefone': return campoTelefone(def);
       case 'opcoes': return campoOpcoes(def, ef, atual);
       case 'sim_nao': return campoSimNao(def, ef, atual);
       case 'multi': return campoMulti(def, ef, atual);
@@ -416,8 +428,10 @@
       if (!confirm('Trocar o negócio descarta o que já foi preenchido. Continuar?')) { e.target.value = S.draft.negocioSel; return; }
     }
     if (novo !== S.draft.negocioSel) {
+      const { lancandoEm, dataVisita, horaVisita } = S.draft;
       liberarUrls();
       S.draft = novoDraft();
+      Object.assign(S.draft, { lancandoEm, dataVisita, horaVisita }); // no lançamento do escritório estes valem para a sequência
       S.draft.negocioSel = novo;
       agendarRascunho();
     }
@@ -453,12 +467,28 @@
     return det;
   }
 
+  /** Lançamento do escritório: em nome de quem, e quando a visita aconteceu de verdade. */
+  function cardLancamento() {
+    const lista = S.vendedores.length ? h('datalist', { id: 'lista-vendedores' }, S.vendedores.map((v) => h('option', { value: v }))) : null;
+    const em = h('input', { type: 'text', id: 'in-lancando-em', list: lista ? 'lista-vendedores' : null, value: S.draft.lancandoEm, placeholder: 'Nome do vendedor', autocomplete: 'off', 'aria-label': 'Lançando em nome de',
+      oninput: (e) => { S.draft.lancandoEm = e.target.value; agendarRascunho(); } });
+    const data = h('input', { type: 'date', id: 'in-data-visita', value: S.draft.dataVisita, 'aria-label': 'Data da visita',
+      onchange: (e) => { S.draft.dataVisita = e.target.value; agendarRascunho(); } });
+    const hora = h('input', { type: 'time', id: 'in-hora-visita', value: S.draft.horaVisita, 'aria-label': 'Hora da visita (opcional)',
+      onchange: (e) => { S.draft.horaVisita = e.target.value; agendarRascunho(); } });
+    return h('div', { class: 'card lancamento' }, h('h2', null, 'Lançamento do escritório'),
+      h('p', { class: 'ajuda' }, 'Sem GPS. A visita entra com a data real informada abaixo e já fica liberada.'),
+      h('div', { class: 'campo', 'data-campo': 'lancando_em' }, h('div', { class: 'rotulo' }, h('span', null, 'Lançando em nome de'), h('span', { class: 'obrig' }, 'obrigatório')), em, lista),
+      h('div', { class: 'campo', 'data-campo': 'data_visita' }, h('div', { class: 'rotulo' }, h('span', null, 'Data da visita'), h('span', { class: 'obrig' }, 'obrigatório')), data),
+      h('div', { class: 'campo', 'data-campo': 'hora_visita' }, h('div', { class: 'rotulo' }, h('span', null, 'Hora (opcional)')), hora));
+  }
+
   function renderVisita() {
     const raiz = $('#view-visita');
     const ef = valoresEfetivos();
     const atual = negocioAtualMapa();
     const cards = [
-      h('div', { class: 'card' }, h('h2', null, 'Local do registro'), h('div', { id: 'gps-corpo' })),
+      S.modoEscritorio ? cardLancamento() : h('div', { class: 'card' }, h('h2', null, 'Local do registro'), h('div', { id: 'gps-corpo' })),
       cardNegocio(),
     ];
     if (S.draft.negocioSel) cards.push(cardRelatorio(ef, atual), cardOpcionais(ef, atual));
@@ -474,19 +504,23 @@
 
   async function salvar() {
     if (S.rec) await pararGravacao();
-    const erros = L.validarRegistro(S.draft);
+    const escritorio = S.modoEscritorio;
+    const erros = L.validarRegistro(Object.assign({}, S.draft, { modo: escritorio ? 'escritorio' : 'campo' }));
     if (erros.length) { mostrarErros(erros); return; }
-    if (!S.vendedor) { pedirVendedor(); return; }
+    if (!escritorio && !S.vendedor) { pedirVendedor(); return; }
     const btn = $('#btn-salvar');
     btn.disabled = true;
     try {
       const agora = new Date();
+      const vendedor = escritorio ? S.draft.lancandoEm.trim() : S.vendedor;
+      const dh = escritorio ? L.dataHoraVisita(S.draft.dataVisita, S.draft.horaVisita) : null;
+      const quando = dh ? dh.data : agora;
       const novo = S.draft.negocioSel === 'NOVO';
       const negocioId = novo ? L.gerarCodigoProvisorio(agora) : S.draft.negocioSel;
       const conhecido = novo ? null : L.listaNegocios(S.registros).find((n) => n.id === negocioId);
       const ident = novo
-        ? { cliente: S.draft.texto.cliente.trim(), fazenda: S.draft.texto.fazenda.trim(), municipio: S.draft.texto.municipio.trim() }
-        : { cliente: conhecido.cliente, fazenda: conhecido.fazenda, municipio: conhecido.municipio };
+        ? { cliente: S.draft.texto.cliente.trim(), fazenda: S.draft.texto.fazenda.trim(), municipio: S.draft.texto.municipio.trim(), telefone: L.limparTelefone(S.draft.texto.telefone) }
+        : { cliente: conhecido.cliente, fazenda: conhecido.fazenda, municipio: conhecido.municipio, telefone: '' };
       const ef = valoresEfetivos();
       const visiveis = L.CAMPOS.filter((c) => (novo || c.grupo !== 'ident') && L.campoVisivel(c, ef));
       const id = L.gerarId();
@@ -507,23 +541,30 @@
         pdfMeta = { arquivo: 'projeto.pdf', nomeOriginal: S.draft.pdf.name, bytes: S.draft.pdf.size };
       }
       const campos = {};
-      visiveis.forEach((def) => { if (temOwn(S.draft.valores, def.key)) campos[def.key] = S.draft.valores[def.key]; });
-      const b = S.gps.best;
+      visiveis.forEach((def) => { if (def.grupo !== 'ident' && temOwn(S.draft.valores, def.key)) campos[def.key] = S.draft.valores[def.key]; });
+      const b = escritorio ? null : S.gps.best;
       const reg = {
         esquema: 1, id, versaoApp: L.APP_VERSAO,
-        nomeRelatorio: L.nomeRelatorio({ vendedor: S.vendedor, cliente: ident.cliente, fazenda: ident.fazenda, municipio: ident.municipio, data: agora }),
-        vendedor: S.vendedor, criadoEm: agora.toISOString(), negocioId, prospectNovo: novo,
-        identificacao: { cliente: ident.cliente, fazenda: ident.fazenda, municipio: ident.municipio, porVoz },
+        nomeRelatorio: L.nomeRelatorio({ vendedor, cliente: ident.cliente, fazenda: ident.fazenda, municipio: ident.municipio, data: quando }),
+        vendedor, criadoEm: agora.toISOString(), negocioId, prospectNovo: novo,
+        identificacao: { cliente: ident.cliente, fazenda: ident.fazenda, municipio: ident.municipio, telefone: ident.telefone, porVoz },
         gps: b ? { lat: b.lat, lng: b.lng, acuraciaM: Math.round(b.acc), capturadoEm: new Date(b.ts).toISOString() } : null,
         campos, audios: audiosMeta, pdf: pdfMeta,
         status: 'pendente', enviados: {}, tentativas: 0, ultimoErro: '', bytes: arquivos.reduce((s, a) => s + a.bytes, 0),
       };
+      if (escritorio) {
+        reg.origem = 'escritorio';
+        reg.lancadoPor = S.vendedor || 'Escritório';
+        reg.dataVisita = dh.iso;
+        reg.dataVisitaSemHora = dh.semHora;
+      }
       await DB.salvarRegistro(reg, arquivos);
       S.registros.push(reg);
       liberarUrls();
-      S.draft = novoDraft();
+      const mantem = escritorio ? { lancandoEm: S.draft.lancandoEm } : {};
+      S.draft = Object.assign(novoDraft(), mantem);
       await DB.put('rascunho', S.draft, 'atual');
-      toast(b ? 'Registro salvo ✓ — pendente de envio' : 'Registro salvo SEM ponto GPS — pendente de envio');
+      toast(escritorio ? 'Lançamento salvo ✓ — pendente de envio' : b ? 'Registro salvo ✓ — pendente de envio' : 'Registro salvo SEM ponto GPS — pendente de envio');
       renderTudo();
       window.scrollTo(0, 0);
       enviarPendentes();
@@ -557,7 +598,8 @@
     } finally { clearTimeout(t); }
   }
   const metaParaEnvio = (r) => ({ esquema: r.esquema, id: r.id, versaoApp: r.versaoApp, nomeRelatorio: r.nomeRelatorio, vendedor: r.vendedor, criadoEm: r.criadoEm,
-    negocioId: r.negocioId, prospectNovo: r.prospectNovo, identificacao: r.identificacao, gps: r.gps, campos: r.campos, audios: r.audios, pdf: r.pdf });
+    negocioId: r.negocioId, prospectNovo: r.prospectNovo, identificacao: r.identificacao, gps: r.gps, campos: r.campos, audios: r.audios, pdf: r.pdf,
+    origem: r.origem, lancadoPor: r.lancadoPor, dataVisita: r.dataVisita, dataVisitaSemHora: r.dataVisitaSemHora });
 
   async function enviarRegistro(reg) {
     const arqs = await DB.arquivosDoRegistro(reg.id);
@@ -620,9 +662,12 @@
         renderTudo();
       },
     }, 'Excluir'));
+    const meta = r.origem === 'escritorio'
+      ? 'Lançamento do escritório · visita de ' + new Date(r.dataVisita).toLocaleDateString('pt-BR') + (r.dataVisitaSemHora ? '' : ' ' + new Date(r.dataVisita).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })) + ' · ' + L.fmtBytes(r.bytes || 0)
+      : quando + ' · ' + L.fmtBytes(r.bytes || 0) + (r.gps ? ' · GPS ±' + r.gps.acuraciaM + ' m' : ' · sem GPS');
     return h('div', { class: 'card reg' },
       h('div', { class: 'reg-nome' }, r.nomeRelatorio),
-      h('div', { class: 'reg-meta' }, quando + ' · ' + L.fmtBytes(r.bytes || 0) + (r.gps ? ' · GPS ±' + r.gps.acuraciaM + ' m' : ' · sem GPS')),
+      h('div', { class: 'reg-meta' }, meta),
       h('div', null, h('span', { class: 'estado ' + st[0] }, st[1])),
       r.ultimoErro && r.status !== 'enviado' ? h('div', { class: 'ajuda' }, 'Último erro: ' + r.ultimoErro) : null,
       h('div', { class: 'reg-acoes' }, acoes));
@@ -648,8 +693,16 @@
       S.endpoint = ep.value.trim(); S.token = tk.value.trim(); gravarCfg(); toast('Configuração salva ✓'); enviarPendentes();
     } }, 'Salvar configuração');
     const teste = h('div', { class: 'ajuda', id: 'cfg-teste' });
+    const modo = h('input', { type: 'checkbox', id: 'cfg-modo-escritorio', checked: S.modoEscritorio ? true : null, onchange: (e) => {
+      S.modoEscritorio = e.target.checked; gravarCfg();
+      if (S.modoEscritorio) pararGPS(); else iniciarGPS();
+      renderTudo();
+    } });
     raiz.replaceChildren(
       h('div', { class: 'card' }, h('h2', null, 'Vendedor'), campoVend),
+      h('div', { class: 'card' }, h('h2', null, 'Lançamento do escritório'),
+        h('label', { class: 'check' }, modo, h('span', null, 'Lançar visita em nome de um vendedor')),
+        h('p', { class: 'ajuda' }, 'Para digitar no escritório uma visita que o vendedor contou: sem GPS, com o nome do vendedor e a data real da visita. Desligue para voltar ao modo de campo.')),
       h('div', { class: 'card' }, h('h2', null, 'Envio ao escritório'),
         h('div', { class: 'campo' }, h('div', { class: 'rotulo' }, 'Endereço do recebedor'), ep),
         h('div', { class: 'campo' }, h('div', { class: 'rotulo' }, 'Código de acesso'), tk),
@@ -690,7 +743,8 @@
     const pill = $('#pill-rede');
     pill.textContent = online ? 'online' : 'sem sinal';
     pill.className = 'pill' + (online ? '' : ' offline');
-    $('#topo-vendedor').textContent = S.vendedor || 'defina o vendedor em Config';
+    $('#topo-vendedor').textContent = S.modoEscritorio ? 'MODO ESCRITÓRIO — lançamento' : (S.vendedor || 'defina o vendedor em Config');
+    document.body.classList.toggle('modo-escritorio', !!S.modoEscritorio);
     const pend = S.registros.filter((r) => r.status !== 'enviado').length;
     $('#topo-pendentes').textContent = S.enviando ? 'enviando…' : pend ? pend + ' pendente' + (pend > 1 ? 's' : '') : (S.registros.length ? 'tudo enviado ✓' : '');
   }
@@ -720,11 +774,12 @@
   /* ---------- início ---------- */
   async function iniciar() {
     const c = lerCfg();
-    S.vendedor = c.vendedor || ''; S.endpoint = c.endpoint || ''; S.token = c.token || ''; S.vendedores = c.vendedores || [];
+    S.vendedor = c.vendedor || ''; S.endpoint = c.endpoint || ''; S.token = c.token || ''; S.vendedores = c.vendedores || []; S.modoEscritorio = !!c.modoEscritorio;
     const veioLink = aplicarLinkConfig();
     try { S.registros = await DB.todosRegistros(); } catch (e) { S.registros = []; toast('Armazenamento local indisponível neste navegador.', 'erro'); }
     try { S.draft = (await DB.get('rascunho', 'atual')) || novoDraft(); } catch (e) { S.draft = novoDraft(); }
     S.draft = Object.assign(novoDraft(), S.draft);
+    S.draft.texto = Object.assign(novoDraft().texto, S.draft.texto);
     if (S.draft.negocioSel && S.draft.negocioSel !== 'NOVO' && !L.listaNegocios(S.registros).some((n) => n.id === S.draft.negocioSel)) S.draft = novoDraft();
 
     document.querySelectorAll('#abas button').forEach((b) => b.addEventListener('click', () => mostrarAba(b.dataset.aba)));
@@ -734,7 +789,7 @@
     window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); S.instalar = e; if (S.aba === 'config') renderConfig(); });
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState !== 'visible') return;
-      if (!S.gps.best || Date.now() - S.gps.best.ts > 10 * 60000) iniciarGPS();
+      if (!S.modoEscritorio && (!S.gps.best || Date.now() - S.gps.best.ts > 10 * 60000)) iniciarGPS();
       enviarPendentes();
     });
     setInterval(() => { if (navigator.onLine) enviarPendentes(); }, 90000);
@@ -745,7 +800,7 @@
     renderTudo();
     mostrarAba('visita');
     iniciarGPS();
-    if (!S.vendedor) pedirVendedor();
+    if (!S.vendedor && !S.modoEscritorio) pedirVendedor();
     if (veioLink) toast('Configuração recebida ✓');
     enviarPendentes();
   }

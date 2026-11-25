@@ -6,7 +6,7 @@
 })(typeof self !== 'undefined' ? self : this, function () {
   'use strict';
 
-  const APP_VERSAO = '1.0.0';
+  const APP_VERSAO = '1.1.0';
   const MESES = ['jan', 'fev', 'mar', 'abr', 'mai', 'jun', 'jul', 'ago', 'set', 'out', 'nov', 'dez'];
 
   /* ---------- listas fechadas (vindas do CRM atual) ---------- */
@@ -24,17 +24,20 @@
   const MOTIVOS_PERDA = ['Preço', 'Problema de relacionamento', 'Preferência por Marca', 'Falta de Atendimento'];
   const ORIGENS = ['Carteira de vendas', 'Indicação de parceiros', 'Canais Digitais', 'Eventos', 'Campanha Fábrica', 'Marketing'];
   const SEGMENTOS = ['Grãos', 'Pecuária', 'Cana'];
+  const TIPOS_SISTEMA = ['Pivô central', 'Carretel', 'Aspersão', 'Outro'];
 
   const asOpcoes = (arr) => arr.map((x) => ({ v: x, t: x }));
 
   /* ---------- definição dos campos ----------
-   * tipo: texto_voz | voz | opcoes | estrelas | mes | data | sim_nao | multi | arquivo
-   * max: duração máxima da gravação (s). obrigatorio: exige preenchimento para salvar. */
+   * tipo: texto_voz | texto | telefone | voz | opcoes | estrelas | mes | data | sim_nao | multi | arquivo
+   * max: duração máxima da gravação (s). obrigatorio: exige preenchimento para salvar.
+   * numero: o campo dita só o número (o escritório grava como número). */
   const CAMPOS = [
-    // identificação (só "Novo prospect"): digitado OU por voz
+    // identificação (só "Novo prospect"): digitado OU por voz; telefone sempre digitado e opcional
     { key: 'cliente', grupo: 'ident', tipo: 'texto_voz', rotulo: 'Nome do cliente', exemplo: 'Ex.: Valdemir Rossini', max: 30 },
     { key: 'fazenda', grupo: 'ident', tipo: 'texto_voz', rotulo: 'Fazenda', exemplo: 'Ex.: Fazenda Samambaia', max: 30 },
     { key: 'municipio', grupo: 'ident', tipo: 'texto_voz', rotulo: 'Município', exemplo: 'Ex.: Batayporã', max: 30 },
+    { key: 'telefone', grupo: 'ident', tipo: 'telefone', rotulo: 'Telefone (opcional)', exemplo: 'Ex.: (67) 99999-0000' },
     // relatório da visita
     { key: 'assunto', grupo: 'relatorio', tipo: 'voz', rotulo: 'O que foi tratado na visita', exemplo: 'Ex.: Apresentei o projeto de 6 pivôs; o cliente quer ajustar o valor', obrigatorio: true, max: 180 },
     { key: 'etapa', grupo: 'relatorio', tipo: 'opcoes', rotulo: 'Etapa do funil', opcoes: ETAPAS },
@@ -49,12 +52,13 @@
     { key: 'proxima_acao', grupo: 'relatorio', tipo: 'voz', rotulo: 'Próxima ação', exemplo: 'Ex.: Voltar na sexta com o valor ajustado', obrigatorio: true, max: 90 },
     { key: 'proxima_acao_data', grupo: 'relatorio', tipo: 'data', rotulo: 'Data da próxima ação' },
     { key: 'observacoes', grupo: 'relatorio', tipo: 'voz', rotulo: 'Observações gerais (fale à vontade)', exemplo: 'Ex.: Cliente comparando com outra marca; decide depois da colheita', max: 300 },
+    { key: 'tipo_sistema', grupo: 'relatorio', tipo: 'opcoes', rotulo: 'Tipo de sistema do projeto', opcoes: asOpcoes(TIPOS_SISTEMA), dica: 'Sem escolher, vale o do negócio (ou Pivô central).' },
     { key: 'pdf', grupo: 'relatorio', tipo: 'arquivo', rotulo: 'PDF do projeto (planilha do orçamento)' },
     // opcionais
     { key: 'segmentacao', grupo: 'opcional', tipo: 'multi', rotulo: 'Segmentação do cliente', opcoes: asOpcoes(SEGMENTOS) },
     { key: 'origem', grupo: 'opcional', tipo: 'opcoes', rotulo: 'Origem do contato', opcoes: asOpcoes(ORIGENS) },
-    { key: 'est_pivos', grupo: 'opcional', tipo: 'voz', rotulo: 'Nº de pivôs (estimativa)', exemplo: 'Ex.: Seis pivôs', max: 20 },
-    { key: 'est_hectares', grupo: 'opcional', tipo: 'voz', rotulo: 'Hectares (estimativa)', exemplo: 'Ex.: Quatrocentos e cinquenta hectares', max: 20 },
+    { key: 'est_pivos', grupo: 'opcional', tipo: 'voz', numero: true, rotulo: 'Nº de pivôs (estimativa)', exemplo: 'Diga só o número. Ex.: seis', max: 15 },
+    { key: 'est_hectares', grupo: 'opcional', tipo: 'voz', numero: true, rotulo: 'Hectares (estimativa)', exemplo: 'Diga só o número. Ex.: quatrocentos e cinquenta', max: 15 },
   ];
 
   const campoPorChave = (k) => CAMPOS.find((c) => c.key === k);
@@ -80,8 +84,9 @@
   /** Quantos campos aparecem na tela em cada cenário (usado nos testes e na tela de ajuda). */
   function contarCampos(o) {
     o = o || {};
-    const base = CAMPOS.filter((c) => c.grupo === 'relatorio' && !c.condicional).length; // 12
-    return 1 + base + (o.prospect ? 3 : 0) + (o.opcionais ? CAMPOS.filter((c) => c.grupo === 'opcional').length : 0) + (o.condicional ? 1 : 0);
+    const base = CAMPOS.filter((c) => c.grupo === 'relatorio' && !c.condicional).length; // 13
+    const ident = CAMPOS.filter((c) => c.grupo === 'ident').length; // 4
+    return 1 + base + (o.prospect ? ident : 0) + (o.opcionais ? CAMPOS.filter((c) => c.grupo === 'opcional').length : 0) + (o.condicional ? 1 : 0);
   }
 
   /* ---------- nomes ---------- */
@@ -129,12 +134,32 @@
     return 'bin';
   }
 
+  /** Telefone digitado: deixa só números e os símbolos usuais. */
+  function limparTelefone(s) {
+    return String(s == null ? '' : s).replace(/[^\d()+\-\s.]/g, '').replace(/\s+/g, ' ').trim();
+  }
+
+  /* ---------- lançamento do escritório: data (e hora, opcional) real da visita ---------- */
+  /** "2026-11-24" + "15:40" → { iso, semHora:false }. Sem hora → meio-dia local, semHora:true. Data inválida → null. */
+  function dataHoraVisita(dataStr, horaStr) {
+    const md = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dataStr || ''));
+    if (!md) return null;
+    const mh = /^(\d{2}):(\d{2})$/.exec(String(horaStr || ''));
+    const semHora = !mh;
+    const d = new Date(+md[1], +md[2] - 1, +md[3], mh ? +mh[1] : 12, mh ? +mh[2] : 0, 0, 0);
+    if (isNaN(d.getTime()) || d.getFullYear() !== +md[1] || d.getMonth() !== +md[2] - 1 || d.getDate() !== +md[3]) return null;
+    return { iso: d.toISOString(), semHora: semHora, data: d };
+  }
+
+  /** Quando a visita aconteceu (para ordenar): data real informada no lançamento do escritório, senão a hora do salvamento. */
+  const quandoDoRegistro = (r) => r.dataVisita || r.criadoEm;
+
   /* ---------- regra "a última visita sobrepõe; sem alteração mantém" ---------- */
   /** Junta os campos TOCADOS de várias visitas do mesmo negócio, da mais antiga para a mais nova.
    *  Valor null = apagado de propósito. Campo não tocado nunca aparece, então o valor anterior permanece. */
   function mesclarCampos(registros) {
     const ordenados = registros.slice().sort((a, b) => {
-      const ta = Date.parse(a.criadoEm), tb = Date.parse(b.criadoEm);
+      const ta = Date.parse(quandoDoRegistro(a)), tb = Date.parse(quandoDoRegistro(b));
       return ta !== tb ? ta - tb : String(a.id).localeCompare(String(b.id));
     });
     const estado = {};
@@ -173,14 +198,20 @@
     return base + (n.municipio ? ' (' + n.municipio + ')' : '');
   }
 
-  /* ---------- validação: só 3 itens são obrigatórios ---------- */
-  function validarRegistro(d) {
+  /* ---------- validação: só 3 itens são obrigatórios (no lançamento do escritório, mais a data e o vendedor) ---------- */
+  function validarRegistro(d, hoje) {
     const erros = [];
     const textoCliente = d.texto && d.texto.cliente && d.texto.cliente.trim();
     if (!d.negocioSel) erros.push('Escolha o negócio ou "Novo prospect".');
     else if (d.negocioSel === 'NOVO' && !textoCliente && !(d.audios && d.audios.cliente)) erros.push('Informe o nome do cliente (digitado ou por voz).');
     if (!(d.audios && d.audios.assunto)) erros.push('Grave o que foi tratado na visita.');
     if (!(d.audios && d.audios.proxima_acao)) erros.push('Grave a próxima ação.');
+    if (d.modo === 'escritorio') {
+      if (!String(d.lancandoEm || '').trim()) erros.push('Informe em nome de qual vendedor está lançando.');
+      const dh = dataHoraVisita(d.dataVisita, d.horaVisita);
+      if (!dh) erros.push('Informe a data em que a visita aconteceu.');
+      else if (dh.data.getTime() > (hoje || new Date()).getTime() + 24 * 3600 * 1000) erros.push('A data da visita está no futuro.');
+    }
     return erros;
   }
 
@@ -196,9 +227,10 @@
   }
 
   return {
-    APP_VERSAO, CAMPOS, ETAPAS, MOTIVOS_GANHO, MOTIVOS_PERDA, ORIGENS, SEGMENTOS,
+    APP_VERSAO, CAMPOS, ETAPAS, MOTIVOS_GANHO, MOTIVOS_PERDA, ORIGENS, SEGMENTOS, TIPOS_SISTEMA,
     campoPorChave, camposAudio, opcoesDoCampo, campoVisivel, contarCampos,
     sanitizeNome, fmtDataCurta, fmtHora, nomeRelatorio, gerarCodigoProvisorio, gerarId, extPorMime,
+    limparTelefone, dataHoraVisita, quandoDoRegistro,
     mesclarCampos, listaNegocios, rotuloNegocio, validarRegistro, fmtDur, fmtBytes,
   };
 });
