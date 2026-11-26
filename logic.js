@@ -6,7 +6,7 @@
 })(typeof self !== 'undefined' ? self : this, function () {
   'use strict';
 
-  const APP_VERSAO = '1.1.0';
+  const APP_VERSAO = '1.2.0';
   const MESES = ['jan', 'fev', 'mar', 'abr', 'mai', 'jun', 'jul', 'ago', 'set', 'out', 'nov', 'dez'];
 
   /* ---------- listas fechadas (vindas do CRM atual) ---------- */
@@ -226,11 +226,163 @@
     return (n / 1048576).toFixed(1) + ' MB';
   }
 
+  /* =====================================================================
+   * v1.2.0 — carteira no aparelho: negócios vindos do escritório, ficha só de leitura,
+   * status das visitas, busca/filtros, ações vencidas e limpeza de áudio/PDF já liberados.
+   * ===================================================================== */
+  const semAcento = (s) => String(s == null ? '' : s).normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+  const mesmoVendedor = (a, b) => semAcento(String(a || '').replace(/\s+/g, ' ').trim()) === semAcento(String(b || '').replace(/\s+/g, ' ').trim()) && semAcento(a) !== '';
+  const hojeIso = (d) => { d = d || new Date(); return d.getFullYear() + '-' + dois(d.getMonth() + 1) + '-' + dois(d.getDate()); };
+  const ehNumero = (x) => typeof x === 'number' && isFinite(x);
+
+  /** 'vencida' (antes de hoje), 'hoje' ou '' (futura / sem data). */
+  function acaoVencida(data, hoje) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(data || ''))) return '';
+    const h = hoje || hojeIso();
+    return data < h ? 'vencida' : data === h ? 'hoje' : '';
+  }
+
+  /** "2026-11-25 08:00" (hora de MS, como o escritório grava) ou ISO → milissegundos; 0 se não entender. */
+  function parseQuando(s) {
+    const t = Date.parse(String(s || '').trim().replace(' ', 'T'));
+    return isNaN(t) ? 0 : t;
+  }
+  const fmtDataBR = (s) => { const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(s || '')); return m ? m[3] + '/' + m[2] + '/' + m[1] : String(s || ''); };
+  const fmtQuando = (s) => { const m = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2}))?/.exec(String(s || '')); return m ? m[3] + '/' + m[2] + '/' + m[1] + (m[4] && String(s).length <= 16 ? ' ' + m[4] + ':' + m[5] : '') : String(s || ''); };
+  const fmtNum = (n, casas) => Number(n).toLocaleString('pt-BR', { minimumFractionDigits: casas || 0, maximumFractionDigits: casas === undefined ? 2 : casas });
+  const fmtReais = (n) => 'R$ ' + fmtNum(n, 2);
+
+  /** R$/ha do projeto: o impresso no PDF; senão valor ÷ área. null se não der para calcular. */
+  function valorPorHa(p) {
+    if (!p) return null;
+    if (ehNumero(p.rs_ha) && p.rs_ha > 0) return p.rs_ha;
+    if (ehNumero(p.valor_total) && p.valor_total > 0 && ehNumero(p.area_ha) && p.area_ha > 0) return Math.round(p.valor_total / p.area_ha * 100) / 100;
+    return null;
+  }
+  const temValorProjeto = (p) => !!p && ehNumero(p.valor_total) && p.valor_total > 0;
+
+  const mapaLink = (gps) => (gps && ehNumero(Number(gps.lat)) && ehNumero(Number(gps.lng)) ? 'https://www.google.com/maps?q=' + Number(gps.lat).toFixed(6) + ',' + Number(gps.lng).toFixed(6) : '');
+
+  function rotuloEtapa(v) { const e = ETAPAS.find((x) => x.v === v); return e ? e.t : String(v || ''); }
+
+  /** Texto de um valor de campo para mostrar na ficha/histórico (somente leitura). */
+  function textoCampo(def, v) {
+    if (v === undefined || v === null || v === '') return '';
+    if (def.tipo === 'estrelas') return '★ ' + v;
+    if (def.tipo === 'sim_nao') return /^s/i.test(String(v)) ? 'Sim' : 'Não';
+    if (def.tipo === 'mes') { const m = /^(\d{4})-(\d{2})/.exec(String(v)); return m ? m[2] + '/' + m[1] : String(v); }
+    if (def.tipo === 'data') return fmtDataBR(v);
+    if (def.tipo === 'multi') return Array.isArray(v) ? v.join(', ') : String(v);
+    if (def.key === 'etapa') return rotuloEtapa(v);
+    if (def.tipo === 'opcoes') { const o = (def.opcoes || []).find((x) => x.v === v); return o ? o.t : String(v); }
+    return String(v);
+  }
+
+  /** Situação da visita para o vendedor: o que está no escritório manda; sem isso, o estado do envio. */
+  function statusVisita(reg, sv) {
+    if (sv) {
+      if (sv.status === 'Liberada') return { codigo: 'liberada', texto: 'Liberada ✓', tom: 'ok' };
+      if (sv.status === 'Rejeitada') return { codigo: 'rejeitada', texto: 'Rejeitada', tom: 'erro' };
+      return { codigo: 'pendente', texto: 'Pendente no escritório', tom: 'atencao' };
+    }
+    if (reg && reg.status === 'enviado') return { codigo: 'processando', texto: 'Enviada — aguardando o escritório', tom: 'atencao' };
+    if (reg && reg.status === 'enviando') return { codigo: 'enviando', texto: 'Enviando…', tom: 'atencao' };
+    return { codigo: 'aguardando_envio', texto: 'Aguardando envio', tom: 'atencao' };
+  }
+
+  /** Áudio/PDF só saem do aparelho depois de: enviado + Liberada + o texto de CADA áudio já voltou (+ PDF copiado). */
+  function podeLimparArquivos(reg, sv) {
+    if (!reg || !sv || reg.limpo) return false;
+    if (reg.status !== 'enviado' || sv.status !== 'Liberada') return false;
+    const chaves = Object.keys(reg.audios || {});
+    if (!chaves.length && !reg.pdf) return false;
+    const temTexto = (v) => (typeof v === 'string' ? v.trim() !== '' : v !== undefined && v !== null && v !== '');
+    const textosOk = chaves.every((k) => { const def = campoPorChave(k); return def && def.grupo === 'ident' ? temTexto(sv[k]) : temTexto((sv.campos || {})[k]); });
+    if (!textosOk) return false;
+    if (reg.pdf && !sv.pdf_ok) return false;
+    return true;
+  }
+
+  /**
+   * Negócios do aparelho = os que o escritório mandou (carteira) + os criados/atualizados aqui que o escritório ainda não devolveu.
+   * Visita com id provisório (PRV-…) já ligada a outro negócio no escritório entra no negócio oficial.
+   * "campos" = o que o escritório tem + o que foi registrado aqui e ainda não voltou da planilha.
+   */
+  function unirNegocios(registros, srvNegocios, srvVisitas) {
+    const sv = {}, alias = {}, srvPorId = {}, itens = {};
+    (srvVisitas || []).forEach((v) => { sv[v.id] = v; if (v.negocio_app && v.negocio && v.negocio_app !== v.negocio) alias[v.negocio_app] = v.negocio; });
+    (srvNegocios || []).forEach((n) => { srvPorId[n.id] = n; });
+    (srvNegocios || []).forEach((n) => {
+      itens[n.id] = { id: n.id, cliente: n.cliente || '', fazenda: n.fazenda || '', municipio: n.municipio || '', telefone: n.telefone || '', gps: n.gps || null,
+        campos: Object.assign({}, n.campos || {}), projeto: n.projeto || null, historico: n.historico || [], nVisitas: n.n_visitas || 0, primeira: n.primeira || '', ultima: n.ultima || '',
+        srv: true, provisorio: false, regs: [], ultimaMs: parseQuando(n.ultima) };
+    });
+    registros.slice().sort((a, b) => Date.parse(a.criadoEm) - Date.parse(b.criadoEm)).forEach((r) => {
+      const id = alias[r.negocioId] && srvPorId[alias[r.negocioId]] ? alias[r.negocioId] : r.negocioId;
+      const it = itens[id] || (itens[id] = { id, cliente: '', fazenda: '', municipio: '', telefone: '', gps: null, campos: {}, projeto: null, historico: [], nVisitas: 0, primeira: '', ultima: '',
+        srv: false, provisorio: String(id).indexOf('PRV-') === 0, regs: [], ultimaMs: 0 });
+      it.regs.push(r);
+      if (!it.srv) {
+        const ident = r.identificacao || {};
+        ['cliente', 'fazenda', 'municipio', 'telefone'].forEach((k) => { if (ident[k]) it[k] = ident[k]; });
+        if (r.gps && !it.gps) it.gps = { lat: r.gps.lat, lng: r.gps.lng, prec: r.gps.acuraciaM };
+      }
+      it.ultimaMs = Math.max(it.ultimaMs, Date.parse(r.criadoEm) || 0);
+    });
+    Object.keys(itens).forEach((id) => {
+      const it = itens[id];
+      const aplicar = it.srv ? it.regs.filter((r) => !sv[r.id]) : it.regs; // o que a planilha já refletiu não se aplica de novo
+      aplicar.slice().sort((a, b) => Date.parse(quandoDoRegistro(a)) - Date.parse(quandoDoRegistro(b))).forEach((r) => {
+        Object.keys(r.campos || {}).forEach((k) => { if (r.campos[k] === null) delete it.campos[k]; else it.campos[k] = r.campos[k]; });
+        const tel = r.identificacao && r.identificacao.telefone;
+        if (tel) it.telefone = tel;
+      });
+      it.naoLiberadas = it.regs.filter((r) => !sv[r.id] || sv[r.id].status !== 'Liberada');
+    });
+    return Object.keys(itens).map((k) => itens[k]).sort((a, b) => b.ultimaMs - a.ultimaMs);
+  }
+
+  /** Busca (cliente, fazenda, município, telefone) + filtros de município, etapa e "ação vencida ou de hoje". */
+  function filtrarNegocios(lista, f, hoje) {
+    f = f || {};
+    const termos = semAcento(f.busca || '').split(/\s+/).filter(Boolean);
+    return lista.filter((n) => {
+      if (f.municipio && semAcento(n.municipio) !== semAcento(f.municipio)) return false;
+      if (f.etapa && (n.campos || {}).etapa !== f.etapa) return false;
+      if (f.vencidas && !acaoVencida((n.campos || {}).proxima_acao_data, hoje)) return false;
+      if (termos.length) {
+        const palha = semAcento([n.cliente, n.fazenda, n.municipio, n.telefone, String(n.telefone || '').replace(/\D/g, '')].join(' '));
+        if (!termos.every((t) => palha.indexOf(t) >= 0)) return false;
+      }
+      return true;
+    });
+  }
+  const municipiosDisponiveis = (lista) => {
+    const m = {};
+    lista.forEach((n) => { if (n.municipio) m[semAcento(n.municipio)] = n.municipio; });
+    return Object.keys(m).sort().map((k) => m[k]);
+  };
+  /** Etapas que existem na lista, na ordem do funil; etapas desconhecidas (vindas do CRM antigo) entram no fim. */
+  const etapasDisponiveis = (lista) => {
+    const usadas = {};
+    lista.forEach((n) => { const e = (n.campos || {}).etapa; if (e) usadas[e] = true; });
+    const conhecidas = ETAPAS.filter((e) => usadas[e.v]).map((e) => ({ v: e.v, t: e.t }));
+    const extras = Object.keys(usadas).filter((v) => !ETAPAS.some((e) => e.v === v)).sort().map((v) => ({ v, t: v }));
+    return conhecidas.concat(extras);
+  };
+  /** Ações com data vencida ou de hoje: as vencidas primeiro, da mais antiga para a mais nova. */
+  const acoesVencidas = (lista, hoje) => lista
+    .map((n) => ({ n, estado: acaoVencida((n.campos || {}).proxima_acao_data, hoje) }))
+    .filter((x) => x.estado)
+    .sort((a, b) => String(a.n.campos.proxima_acao_data).localeCompare(String(b.n.campos.proxima_acao_data)));
+
   return {
     APP_VERSAO, CAMPOS, ETAPAS, MOTIVOS_GANHO, MOTIVOS_PERDA, ORIGENS, SEGMENTOS, TIPOS_SISTEMA,
     campoPorChave, camposAudio, opcoesDoCampo, campoVisivel, contarCampos,
     sanitizeNome, fmtDataCurta, fmtHora, nomeRelatorio, gerarCodigoProvisorio, gerarId, extPorMime,
     limparTelefone, dataHoraVisita, quandoDoRegistro,
     mesclarCampos, listaNegocios, rotuloNegocio, validarRegistro, fmtDur, fmtBytes,
+    semAcento, mesmoVendedor, hojeIso, acaoVencida, parseQuando, fmtDataBR, fmtQuando, fmtNum, fmtReais, valorPorHa, temValorProjeto, mapaLink, rotuloEtapa, textoCampo,
+    statusVisita, podeLimparArquivos, unirNegocios, filtrarNegocios, municipiosDisponiveis, etapasDisponiveis, acoesVencidas,
   };
 });

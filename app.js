@@ -1,5 +1,6 @@
 /* app.js — CRM Visitas · Copasul (PWA, funciona sem sinal)
- * Fluxo: abre → GPS automático → escolhe negócio → grava por voz cada campo → salva → envia quando houver sinal.
+ * Fluxo: lista de negócios (carteira do escritório) → ficha só de leitura → "Atualizar negócio" (ou "Novo negócio") → GPS → grava por voz
+ * cada campo → salva → envia quando houver sinal. O aparelho se atualiza sozinho com o escritório (status, textos, carteira).
  * Modo "lançamento do escritório" (Config): sem GPS; informa o vendedor e a data real da visita. */
 (function () {
   'use strict';
@@ -31,15 +32,24 @@
   /* ---------- estado ---------- */
   const S = {
     vendedor: '', vendedores: [], endpoint: '', token: '', modoEscritorio: false,
-    aba: 'visita', draft: null, registros: [],
+    tela: 'lista', fichaId: '', draft: null, registros: [],
+    srv: { negocios: [], visitas: [], meta: null }, lista: [],
+    filtro: { busca: '', municipio: '', etapa: '', vencidas: false },
+    sync: { rodando: false, erro: '', aviso: '', ultimaTentativa: 0 },
+    histAberto: '',
     gps: { status: 'idle', best: null, watchId: null, timer: null },
     rec: null, enviando: false, instalar: null, opcionalAberto: false,
   };
   const novoDraft = () => ({
     negocioSel: '', valores: {}, texto: { cliente: '', fazenda: '', municipio: '', telefone: '' }, audios: {}, pdf: null,
-    lancandoEm: '', dataVisita: '', horaVisita: '',
+    lancandoEm: '', dataVisita: '', horaVisita: '', presenca: 'local', telefoneInicial: '',
   });
   const temOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+
+  /* ---------- negócios do aparelho = carteira do escritório + o que foi feito aqui e ainda não voltou ---------- */
+  const negocioPorId = (id) => S.lista.find((n) => n.id === id) || null;
+  const srvVisitasPorId = () => { const m = {}; S.srv.visitas.forEach((v) => { m[v.id] = v; }); return m; };
+  function recomputar() { S.lista = L.unirNegocios(S.registros, S.srv.negocios, S.srv.visitas); }
 
   /* ---------- configuração local ---------- */
   const CFG_KEY = 'crmcopasul.cfg';
@@ -56,6 +66,7 @@
       const o = JSON.parse(b64uDec(m[1]));
       if (o.endpoint) S.endpoint = o.endpoint;
       if (o.token) S.token = o.token;
+      if (o.vendedor) S.vendedor = o.vendedor;
       if (Array.isArray(o.vendedores)) S.vendedores = o.vendedores;
       gravarCfg();
       history.replaceState(null, '', location.pathname + location.search);
@@ -63,18 +74,23 @@
     } catch (e) { return false; }
   }
 
-  /* ---------- banco local (IndexedDB) ---------- */
+  /* ---------- banco local (IndexedDB) ----------
+   * v1: registros (visitas feitas aqui), arquivos (áudios/PDF), rascunho.
+   * v2: negocios + visitas_srv + meta = a carteira que veio do escritório (substituída inteira a cada atualização). */
   const DB = {
     _db: null,
     abrir() {
       if (this._db) return this._db;
       this._db = new Promise((res, rej) => {
-        const r = indexedDB.open('crm-copasul', 1);
+        const r = indexedDB.open('crm-copasul', 2);
         r.onupgradeneeded = () => {
           const db = r.result;
-          db.createObjectStore('registros', { keyPath: 'id' });
-          db.createObjectStore('arquivos', { keyPath: 'chave' }).createIndex('registro', 'registroId');
-          db.createObjectStore('rascunho');
+          if (!db.objectStoreNames.contains('registros')) db.createObjectStore('registros', { keyPath: 'id' });
+          if (!db.objectStoreNames.contains('arquivos')) db.createObjectStore('arquivos', { keyPath: 'chave' }).createIndex('registro', 'registroId');
+          if (!db.objectStoreNames.contains('rascunho')) db.createObjectStore('rascunho');
+          if (!db.objectStoreNames.contains('negocios')) db.createObjectStore('negocios', { keyPath: 'id' });
+          if (!db.objectStoreNames.contains('visitas_srv')) db.createObjectStore('visitas_srv', { keyPath: 'id' });
+          if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta');
         };
         r.onsuccess = () => res(r.result);
         r.onerror = () => rej(r.error);
@@ -94,12 +110,20 @@
     },
     put(store, val, key) { return this._tx(store, 'readwrite', (t) => (key !== undefined ? t.objectStore(store).put(val, key) : t.objectStore(store).put(val))); },
     get(store, key) { return this._tx(store, 'readonly', (t) => t.objectStore(store).get(key)); },
-    todosRegistros() { return this._tx('registros', 'readonly', (t) => t.objectStore('registros').getAll()); },
+    todos(store) { return this._tx(store, 'readonly', (t) => t.objectStore(store).getAll()); },
+    todosRegistros() { return this.todos('registros'); },
     arquivosDoRegistro(id) { return this._tx('arquivos', 'readonly', (t) => t.objectStore('arquivos').index('registro').getAll(id)); },
     salvarRegistro(reg, arqs) {
       return this._tx(['registros', 'arquivos'], 'readwrite', (t) => {
         t.objectStore('registros').put(reg);
         arqs.forEach((a) => t.objectStore('arquivos').put(a));
+      });
+    },
+    /** Apaga só os áudios/PDF do registro (o registro e os textos ficam). */
+    limparArquivos(id) {
+      return this._tx('arquivos', 'readwrite', (t) => {
+        const rq = t.objectStore('arquivos').index('registro').openKeyCursor(IDBKeyRange.only(id));
+        rq.onsuccess = () => { const c = rq.result; if (c) { t.objectStore('arquivos').delete(c.primaryKey); c.continue(); } };
       });
     },
     excluirRegistro(id) {
@@ -108,6 +132,19 @@
         const rq = t.objectStore('arquivos').index('registro').openKeyCursor(IDBKeyRange.only(id));
         rq.onsuccess = () => { const c = rq.result; if (c) { t.objectStore('arquivos').delete(c.primaryKey); c.continue(); } };
       });
+    },
+    /** Troca a carteira inteira de uma vez (tudo ou nada). */
+    salvarCarteira(negocios, visitas, meta) {
+      return this._tx(['negocios', 'visitas_srv', 'meta'], 'readwrite', (t) => {
+        const n = t.objectStore('negocios'), v = t.objectStore('visitas_srv');
+        n.clear(); v.clear();
+        negocios.forEach((x) => n.put(x));
+        visitas.forEach((x) => v.put(x));
+        t.objectStore('meta').put(meta, 'sync');
+      });
+    },
+    limparCarteira() {
+      return this._tx(['negocios', 'visitas_srv', 'meta'], 'readwrite', (t) => { t.objectStore('negocios').clear(); t.objectStore('visitas_srv').clear(); t.objectStore('meta').clear(); });
     },
   };
 
@@ -140,7 +177,7 @@
   }
   function iniciarGPS() {
     pararGPS();
-    if (S.modoEscritorio) return; // lançamento do escritório não marca ponto
+    if (S.modoEscritorio || S.draft.presenca === 'distancia') return; // lançamento do escritório e visita à distância não marcam ponto
     if (!('geolocation' in navigator)) { S.gps.status = 'indisponivel'; renderGps(); return; }
     S.gps.status = 'buscando';
     S.gps.best = null;
@@ -251,11 +288,11 @@
   }
   const draftTemConteudo = () => {
     const d = S.draft;
-    return Object.keys(d.valores).length || Object.keys(d.audios).length || d.pdf || d.texto.cliente || d.texto.fazenda || d.texto.municipio || d.texto.telefone;
+    return Object.keys(d.valores).length || Object.keys(d.audios).length || d.pdf || d.texto.cliente || d.texto.fazenda || d.texto.municipio || (d.texto.telefone || '') !== (d.telefoneInicial || '');
   };
 
   /* ---------- valores atuais (último estado conhecido do negócio) ---------- */
-  const atualDoNegocio = (id) => L.mesclarCampos(S.registros.filter((r) => r.negocioId === id));
+  const atualDoNegocio = (id) => { const n = negocioPorId(id); return n ? n.campos : {}; };
   const negocioAtualMapa = () => (S.draft.negocioSel && S.draft.negocioSel !== 'NOVO' ? atualDoNegocio(S.draft.negocioSel) : {});
   function valoresEfetivos() {
     const ef = Object.assign({}, negocioAtualMapa());
@@ -309,7 +346,10 @@
     const tocado = temOwn(S.draft.valores, def.key);
     const sel = tocado ? S.draft.valores[def.key] : undefined;
     const atualV = atual[def.key];
-    const chips = L.opcoesDoCampo(def, ef).map((o) =>
+    const opcoes = L.opcoesDoCampo(def, ef).slice();
+    // valor vindo do CRM antigo que não está na lista do app (ex.: outra etapa): aparece como chip extra para poder ser mantido
+    if (atualV !== undefined && atualV !== null && atualV !== '' && !opcoes.some((o) => o.v === atualV)) opcoes.push({ v: atualV, t: String(atualV) + ' (atual)' });
+    const chips = opcoes.map((o) =>
       h('button', { type: 'button', class: 'chip' + (sel === o.v ? ' sel' : '') + (!tocado && atualV === o.v ? ' atualmarca' : ''), onclick: () => alternarValor(def.key, o.v) }, o.t));
     return envolver(def, [h('div', { class: 'chips' }, chips), notaAtual(def, atualV)]);
   }
@@ -393,7 +433,12 @@
     } else caixa.append(h('span', { class: 'voz-info', id: 'info-' + def.key }, 'até ' + L.fmtDur(def.max)));
     return caixa;
   }
-  function campoVoz(def) { return envolver(def, widgetVoz(def)); }
+  /** Campo de voz: mostra o texto que o escritório transcreveu da última vez ("Atual") e o mantém se não for regravado. */
+  function campoVoz(def, atual) {
+    const av = atual ? atual[def.key] : undefined;
+    const nota = av !== undefined && av !== null && av !== '' && !S.draft.audios[def.key] ? h('div', { class: 'atual', 'data-atual': def.key }, 'Atual: ' + L.textoCampo(def, av) + ' (mantido se você não gravar)') : null;
+    return envolver(def, [widgetVoz(def), nota]);
+  }
   function campoTextoVoz(def) {
     return envolver(def, h('div', { class: 'texto-voz' },
       h('input', { type: 'text', placeholder: def.exemplo, value: S.draft.texto[def.key], autocomplete: 'off', 'aria-label': def.rotulo,
@@ -408,7 +453,7 @@
 
   function renderCampo(def, ef, atual) {
     switch (def.tipo) {
-      case 'voz': return campoVoz(def);
+      case 'voz': return campoVoz(def, atual);
       case 'texto_voz': return campoTextoVoz(def);
       case 'telefone': return campoTelefone(def);
       case 'opcoes': return campoOpcoes(def, ef, atual);
@@ -421,37 +466,71 @@
     }
   }
 
-  /* ---------- tela: Visita ---------- */
-  function onNegocio(e) {
-    const novo = e.target.value;
-    if (novo !== S.draft.negocioSel && draftTemConteudo()) {
-      if (!confirm('Trocar o negócio descarta o que já foi preenchido. Continuar?')) { e.target.value = S.draft.negocioSel; return; }
-    }
-    if (novo !== S.draft.negocioSel) {
+  /* ---------- tela: Visita (novo negócio ou "Atualizar negócio") ---------- */
+  function iniciarVisita(id) {
+    const outro = !!S.draft.negocioSel && S.draft.negocioSel !== id;
+    if (outro && draftTemConteudo() && !confirm('Há uma visita em andamento em outro negócio. Descartar e começar esta?')) return;
+    if (S.draft.negocioSel !== id) {
       const { lancandoEm, dataVisita, horaVisita } = S.draft;
       liberarUrls();
       S.draft = novoDraft();
       Object.assign(S.draft, { lancandoEm, dataVisita, horaVisita }); // no lançamento do escritório estes valem para a sequência
-      S.draft.negocioSel = novo;
+      S.draft.negocioSel = id;
+      const n = id === 'NOVO' ? null : negocioPorId(id);
+      if (n && n.telefone) { S.draft.texto.telefone = n.telefone; S.draft.telefoneInicial = n.telefone; }
       agendarRascunho();
     }
+    mostrarTela('visita');
+    iniciarGPS();
+  }
+  async function sairDaVisita() {
+    if (S.rec) await pararGravacao();
+    pararGPS();
+    if (S.draft.negocioSel && S.draft.negocioSel !== 'NOVO' && negocioPorId(S.draft.negocioSel)) { S.fichaId = S.draft.negocioSel; mostrarTela('ficha'); } else mostrarTela('lista');
+  }
+  async function descartarVisita() {
+    if (draftTemConteudo() && !confirm('Descartar o que já foi preenchido nesta visita?')) return;
+    if (S.rec) await pararGravacao();
+    liberarUrls(); pararGPS();
+    const { lancandoEm } = S.draft;
+    S.draft = Object.assign(novoDraft(), lancandoEm ? { lancandoEm } : {});
+    agendarRascunho();
+    mostrarTela('lista');
+  }
+  function definirPresenca(v) {
+    S.draft.presenca = v;
+    agendarRascunho();
     renderVisita();
+    if (v === 'distancia') pararGPS(); else iniciarGPS();
+  }
+
+  function cardTopoVisita() {
+    return h('div', { class: 'barra-voltar' },
+      h('button', { class: 'btn pequeno', type: 'button', id: 'btn-voltar', onclick: sairDaVisita }, '← Voltar'),
+      h('button', { class: 'link', type: 'button', id: 'btn-descartar', onclick: descartarVisita }, 'Descartar visita'));
+  }
+
+  /** Onde a visita aconteceu: na propriedade (grava GPS e pode corrigir o ponto do negócio) ou à distância (sem GPS; não move o ponto). */
+  function cardLocal() {
+    const pres = S.draft.presenca || 'local';
+    const chips = h('div', { class: 'chips' }, [['local', 'Na propriedade (grava GPS)'], ['distancia', 'À distância (sem GPS)']].map(([v, t]) =>
+      h('button', { type: 'button', id: 'pres-' + v, class: 'chip' + (pres === v ? ' sel' : ''), onclick: () => definirPresenca(v) }, t)));
+    return h('div', { class: 'card' }, h('h2', null, 'Local do registro'), chips,
+      pres === 'local' ? h('div', { id: 'gps-corpo' }) : h('p', { class: 'ajuda' }, 'Sem GPS: o ponto do negócio não muda.'));
   }
 
   function cardNegocio() {
-    const lista = L.listaNegocios(S.registros);
-    const sel = h('select', { id: 'sel-negocio', 'aria-label': 'Negócio', onchange: onNegocio },
-      h('option', { value: '' }, 'Escolha o negócio…'),
-      h('option', { value: 'NOVO' }, '➕ Novo prospect'),
-      lista.map((n) => h('option', { value: n.id }, L.rotuloNegocio(n) + (n.provisorio ? ' · novo' : ''))));
-    sel.value = S.draft.negocioSel;
-    const filhos = [h('h2', null, 'Negócio'), sel];
-    const ex = lista.find((n) => n.id === S.draft.negocioSel);
-    if (ex) filhos.push(h('div', { class: 'atual' }, 'Última visita: ' + new Date(ex.ultimaVisita).toLocaleDateString('pt-BR')));
-    if (S.draft.negocioSel === 'NOVO') {
+    const novo = S.draft.negocioSel === 'NOVO';
+    const n = novo ? null : negocioPorId(S.draft.negocioSel);
+    const filhos = [h('h2', null, novo ? 'Novo negócio' : 'Atualizar negócio')];
+    if (novo) {
       filhos.push(h('p', { class: 'ajuda' }, 'Digite ou grave o nome. Se gravar, o escritório completa a identificação.'));
       L.CAMPOS.filter((c) => c.grupo === 'ident').forEach((def) => filhos.push(renderCampo(def, {}, {})));
-    }
+    } else if (n) {
+      filhos.push(h('div', { class: 'ident-fixa', id: 'ident-fixa' }, L.rotuloNegocio(n)),
+        h('p', { class: 'ajuda' }, 'Cliente, fazenda e município só o escritório altera. O telefone você pode corrigir.'),
+        renderCampo(L.campoPorChave('telefone'), {}, {}));
+    } else filhos.push(h('p', { class: 'ajuda' }, 'Negócio não encontrado neste aparelho.'));
     return h('div', { class: 'card' }, filhos);
   }
 
@@ -485,14 +564,10 @@
 
   function renderVisita() {
     const raiz = $('#view-visita');
+    if (!S.draft.negocioSel) { raiz.replaceChildren(h('div', { class: 'vazio' }, 'Escolha um negócio na aba Negócios.')); return; }
     const ef = valoresEfetivos();
     const atual = negocioAtualMapa();
-    const cards = [
-      S.modoEscritorio ? cardLancamento() : h('div', { class: 'card' }, h('h2', null, 'Local do registro'), h('div', { id: 'gps-corpo' })),
-      cardNegocio(),
-    ];
-    if (S.draft.negocioSel) cards.push(cardRelatorio(ef, atual), cardOpcionais(ef, atual));
-    raiz.replaceChildren(...cards);
+    raiz.replaceChildren(cardTopoVisita(), S.modoEscritorio ? cardLancamento() : cardLocal(), cardNegocio(), cardRelatorio(ef, atual), cardOpcionais(ef, atual));
     renderGps();
   }
 
@@ -517,10 +592,12 @@
       const quando = dh ? dh.data : agora;
       const novo = S.draft.negocioSel === 'NOVO';
       const negocioId = novo ? L.gerarCodigoProvisorio(agora) : S.draft.negocioSel;
-      const conhecido = novo ? null : L.listaNegocios(S.registros).find((n) => n.id === negocioId);
+      const conhecido = novo ? null : negocioPorId(negocioId);
+      if (!novo && !conhecido) throw new Error('negócio não encontrado neste aparelho');
+      const tel = L.limparTelefone(S.draft.texto.telefone);
       const ident = novo
-        ? { cliente: S.draft.texto.cliente.trim(), fazenda: S.draft.texto.fazenda.trim(), municipio: S.draft.texto.municipio.trim(), telefone: L.limparTelefone(S.draft.texto.telefone) }
-        : { cliente: conhecido.cliente, fazenda: conhecido.fazenda, municipio: conhecido.municipio, telefone: '' };
+        ? { cliente: S.draft.texto.cliente.trim(), fazenda: S.draft.texto.fazenda.trim(), municipio: S.draft.texto.municipio.trim(), telefone: tel }
+        : { cliente: conhecido.cliente, fazenda: conhecido.fazenda, municipio: conhecido.municipio, telefone: tel && tel !== (S.draft.telefoneInicial || '') ? tel : '' };
       const ef = valoresEfetivos();
       const visiveis = L.CAMPOS.filter((c) => (novo || c.grupo !== 'ident') && L.campoVisivel(c, ef));
       const id = L.gerarId();
@@ -542,7 +619,8 @@
       }
       const campos = {};
       visiveis.forEach((def) => { if (def.grupo !== 'ident' && temOwn(S.draft.valores, def.key)) campos[def.key] = S.draft.valores[def.key]; });
-      const b = escritorio ? null : S.gps.best;
+      const aDistancia = !escritorio && S.draft.presenca === 'distancia';
+      const b = escritorio || aDistancia ? null : S.gps.best; // à distância: sem GPS, para não mover o ponto do negócio
       const reg = {
         esquema: 1, id, versaoApp: L.APP_VERSAO,
         nomeRelatorio: L.nomeRelatorio({ vendedor, cliente: ident.cliente, fazenda: ident.fazenda, municipio: ident.municipio, data: quando }),
@@ -552,6 +630,7 @@
         campos, audios: audiosMeta, pdf: pdfMeta,
         status: 'pendente', enviados: {}, tentativas: 0, ultimoErro: '', bytes: arquivos.reduce((s, a) => s + a.bytes, 0),
       };
+      if (aDistancia) reg.presenca = 'distancia';
       if (escritorio) {
         reg.origem = 'escritorio';
         reg.lancadoPor = S.vendedor || 'Escritório';
@@ -560,13 +639,15 @@
       }
       await DB.salvarRegistro(reg, arquivos);
       S.registros.push(reg);
+      recomputar();
       liberarUrls();
+      pararGPS();
       const mantem = escritorio ? { lancandoEm: S.draft.lancandoEm } : {};
       S.draft = Object.assign(novoDraft(), mantem);
       await DB.put('rascunho', S.draft, 'atual');
-      toast(escritorio ? 'Lançamento salvo ✓ — pendente de envio' : b ? 'Registro salvo ✓ — pendente de envio' : 'Registro salvo SEM ponto GPS — pendente de envio');
-      renderTudo();
-      window.scrollTo(0, 0);
+      toast(escritorio ? 'Lançamento salvo ✓ — pendente de envio' : aDistancia ? 'Registro salvo (à distância, sem GPS) ✓ — pendente de envio' : b ? 'Registro salvo ✓ — pendente de envio' : 'Registro salvo SEM ponto GPS — pendente de envio');
+      atualizarTopo();
+      if (!novo) { S.fichaId = negocioId; mostrarTela('ficha'); } else mostrarTela('lista');
       enviarPendentes();
     } catch (e) {
       toast('Não consegui salvar: ' + (e && e.message ? e.message : e), 'erro');
@@ -589,7 +670,7 @@
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), 90000);
     try {
-      const resp = await fetch(S.endpoint, { method: 'POST', body: JSON.stringify(Object.assign({}, obj, { token: S.token })), signal: ctrl.signal, redirect: 'follow' });
+      const resp = await fetch(S.endpoint, { method: 'POST', body: JSON.stringify(Object.assign({}, obj, { token: S.token, vendedor: S.vendedor })), signal: ctrl.signal, redirect: 'follow' });
       const txt = await resp.text();
       let j;
       try { j = JSON.parse(txt); } catch (e) { throw new Error('Resposta inesperada do recebedor.'); }
@@ -647,65 +728,318 @@
     else if (falhas && manual) toast('Não enviou: ' + (fila[0].ultimoErro || 'sem conexão'), 'erro');
   }
 
-  /* ---------- tela: Histórico ---------- */
-  function cardReg(r) {
-    const st = r.status === 'enviado' ? ['ok', 'Enviado ✓'] : r.status === 'enviando' ? ['atencao', 'Enviando…'] : ['atencao', 'Pendente'];
-    const quando = new Date(r.criadoEm).toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' });
-    const acoes = [];
-    if (r.status !== 'enviado') acoes.push(h('button', { class: 'btn pequeno primario', type: 'button', onclick: () => enviarPendentes(true) }, 'Enviar agora'));
-    acoes.push(h('button', {
-      class: 'btn pequeno perigo', type: 'button',
-      onclick: async () => {
-        if (!confirm(r.status === 'enviado' ? 'Excluir este registro do aparelho? (ele já foi enviado)' : 'Este registro ainda NÃO foi enviado. Excluir mesmo assim?')) return;
-        await DB.excluirRegistro(r.id);
-        S.registros = S.registros.filter((x) => x.id !== r.id);
-        renderTudo();
-      },
-    }, 'Excluir'));
-    const meta = r.origem === 'escritorio'
-      ? 'Lançamento do escritório · visita de ' + new Date(r.dataVisita).toLocaleDateString('pt-BR') + (r.dataVisitaSemHora ? '' : ' ' + new Date(r.dataVisita).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })) + ' · ' + L.fmtBytes(r.bytes || 0)
-      : quando + ' · ' + L.fmtBytes(r.bytes || 0) + (r.gps ? ' · GPS ±' + r.gps.acuraciaM + ' m' : ' · sem GPS');
-    return h('div', { class: 'card reg' },
-      h('div', { class: 'reg-nome' }, r.nomeRelatorio),
+  /* ---------- carteira: o aparelho sempre se atualiza com o escritório ---------- */
+  const SYNC_INTERVALO_MS = 5 * 60000;
+  function textoSync() {
+    if (S.sync.rodando) return 'Atualizando com o escritório…';
+    const m = S.srv.meta;
+    const q = m && m.quando ? 'Atualizado em ' + new Date(m.quando).toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' }) : 'Ainda não atualizado com o escritório';
+    return q + (S.sync.erro ? ' · sem conexão com o escritório: ' + S.sync.erro : S.sync.aviso ? ' · ' + S.sync.aviso : '');
+  }
+  function renderSyncInfo() {
+    ['sync-info', 'cfg-sync-info'].forEach((id) => { const el = document.getElementById(id); if (el) el.textContent = textoSync(); });
+  }
+
+  async function sincronizar(manual) {
+    if (S.sync.rodando) return;
+    if (S.modoEscritorio) { if (manual) toast('No modo escritório não há carteira.'); return; }
+    if (!S.endpoint || !S.token || !S.vendedor) { if (manual) toast('Informe o endereço, o seu nome e o código de acesso em Config.', 'erro'); return; }
+    if (!navigator.onLine) { if (manual) toast('Sem sinal. Mostrando o que está salvo no aparelho.', 'erro'); return; }
+    S.sync.rodando = true; S.sync.erro = ''; renderSyncInfo();
+    try {
+      const j = await postar({ acao: 'carteira' });
+      if (j.carteira && L.mesmoVendedor(j.carteira.vendedor, S.vendedor)) {
+        const negocios = j.carteira.negocios || [], visitas = j.carteira.visitas || [];
+        const meta = { quando: new Date().toISOString(), geradoEm: j.carteira.gerado_em || '', versaoProc: j.carteira.versao_proc || '', vendedor: S.vendedor };
+        await DB.salvarCarteira(negocios, visitas, meta);
+        S.srv = { negocios, visitas, meta };
+        S.sync.aviso = '';
+        await limparArquivosLiberados();
+        if (manual) toast('Carteira atualizada ✓ (' + negocios.length + ' negócio' + (negocios.length === 1 ? '' : 's') + ')');
+      } else {
+        S.sync.aviso = j.aviso || 'Nada novo do escritório.';
+        if (manual) toast(S.sync.aviso);
+      }
+    } catch (e) {
+      S.sync.erro = String((e && e.message) || e);
+      if (manual) toast('Não atualizou: ' + S.sync.erro, 'erro');
+    } finally {
+      S.sync.rodando = false; S.sync.ultimaTentativa = Date.now();
+      recomputar(); renderTudo();
+    }
+  }
+  const sincronizarSePassou = () => { if (Date.now() - S.sync.ultimaTentativa > SYNC_INTERVALO_MS) sincronizar(); };
+
+  /** Áudio/PDF já Liberados (texto de volta, PDF copiado no escritório) saem do aparelho; o registro e o texto ficam. */
+  async function limparArquivosLiberados() {
+    const mapa = srvVisitasPorId();
+    let n = 0;
+    for (const r of S.registros) {
+      if (!L.podeLimparArquivos(r, mapa[r.id])) continue;
+      try { await DB.limparArquivos(r.id); r.limpo = true; r.limpoEm = new Date().toISOString(); await DB.put('registros', r); n++; } catch (e) { /* tenta na próxima */ }
+    }
+    return n;
+  }
+
+  /** Troca o conteúdo de uma tela ignorando itens nulos (replaceChildren escreveria a palavra "null"). */
+  function montar(raiz) { raiz.replaceChildren(...Array.prototype.slice.call(arguments, 1).filter((x) => x)); }
+
+  /* ---------- tela: Negócios (lista) ---------- */
+  function tagData(data) {
+    const e = L.acaoVencida(data);
+    return e === 'vencida' ? h('span', { class: 'estado erro' }, 'vencida') : e === 'hoje' ? h('span', { class: 'estado atencao' }, 'hoje') : null;
+  }
+  /** "R$ 6.162.000,00 · R$ 15.521,16/ha" — o valor do pivô sempre junto do custo por hectare. */
+  function linhaProjeto(p) {
+    if (!L.temValorProjeto(p)) return '';
+    const rs = L.valorPorHa(p);
+    return L.fmtReais(p.valor_total) + (rs ? ' · ' + L.fmtReais(rs) + '/ha' : '');
+  }
+  function itemLista(n) {
+    const c = n.campos || {};
+    const proj = linhaProjeto(n.projeto);
+    const aguardando = !n.srv;
+    return h('button', { type: 'button', class: 'neg', 'data-id': n.id, onclick: () => abrirFicha(n.id) },
+      h('div', { class: 'neg-nome' }, L.rotuloNegocio(n)),
+      h('div', { class: 'neg-linha' },
+        c.etapa ? h('span', { class: 'estado' }, L.rotuloEtapa(c.etapa)) : null,
+        aguardando ? h('span', { class: 'estado atencao' }, 'aguardando liberação') : null,
+        n.srv && n.naoLiberadas.length ? h('span', { class: 'estado atencao' }, n.naoLiberadas.length + ' visita' + (n.naoLiberadas.length > 1 ? 's' : '') + ' não liberada' + (n.naoLiberadas.length > 1 ? 's' : '')) : null),
+      proj ? h('div', { class: 'neg-proj' }, proj) : null,
+      c.proxima_acao || c.proxima_acao_data
+        ? h('div', { class: 'neg-acao' }, '➜ ' + (c.proxima_acao || 'Próxima ação') + (c.proxima_acao_data ? ' · ' + L.fmtDataBR(c.proxima_acao_data) : '') + ' ', tagData(c.proxima_acao_data))
+        : null);
+  }
+  const filtroAtivo = () => !!(S.filtro.busca || S.filtro.municipio || S.filtro.etapa || S.filtro.vencidas);
+
+  function renderItensLista() {
+    const caixa = document.getElementById('lista-itens');
+    if (!caixa) return;
+    const vistos = L.filtrarNegocios(S.lista, S.filtro);
+    const cont = document.getElementById('lista-contagem');
+    const lim = document.getElementById('btn-limpar-filtros');
+    if (lim) lim.hidden = !filtroAtivo();
+    if (cont) cont.textContent = filtroAtivo() ? vistos.length + ' de ' + S.lista.length + ' negócios' : S.lista.length + ' negócio' + (S.lista.length === 1 ? '' : 's');
+    if (!S.lista.length) caixa.replaceChildren(h('div', { class: 'vazio' }, 'Nenhum negócio ainda. O escritório envia os negócios da sua carteira; ou toque em "Novo negócio".'));
+    else if (!vistos.length) caixa.replaceChildren(h('div', { class: 'vazio' }, 'Nenhum negócio com esses filtros.'));
+    else caixa.replaceChildren(...vistos.map(itemLista));
+  }
+
+  function renderLista() {
+    const raiz = $('#view-lista');
+    const venc = L.acoesVencidas(S.lista);
+    const muns = L.municipiosDisponiveis(S.lista), etapas = L.etapasDisponiveis(S.lista);
+    const emAndamento = S.draft && S.draft.negocioSel && draftTemConteudo();
+    const nomeAndamento = emAndamento ? (S.draft.negocioSel === 'NOVO' ? 'novo negócio' : (negocioPorId(S.draft.negocioSel) ? L.rotuloNegocio(negocioPorId(S.draft.negocioSel)) : 'negócio')) : '';
+
+    const busca = h('input', { type: 'text', id: 'busca', value: S.filtro.busca, placeholder: 'Buscar cliente, fazenda, município ou telefone', autocomplete: 'off', 'aria-label': 'Buscar negócio',
+      oninput: (e) => { S.filtro.busca = e.target.value; renderItensLista(); } });
+    const selMun = h('select', { id: 'f-municipio', 'aria-label': 'Filtrar por município', onchange: (e) => { S.filtro.municipio = e.target.value; renderLista(); } },
+      h('option', { value: '' }, 'Todos os municípios'), muns.map((m) => h('option', { value: m }, m)));
+    selMun.value = S.filtro.municipio;
+    const selEt = h('select', { id: 'f-etapa', 'aria-label': 'Filtrar por etapa', onchange: (e) => { S.filtro.etapa = e.target.value; renderLista(); } },
+      h('option', { value: '' }, 'Todas as etapas'), etapas.map((x) => h('option', { value: x.v }, x.t)));
+    selEt.value = S.filtro.etapa;
+    const chkV = h('input', { type: 'checkbox', id: 'f-vencidas', checked: S.filtro.vencidas ? true : null, onchange: (e) => { S.filtro.vencidas = e.target.checked; renderLista(); } });
+
+    montar(raiz,
+      h('div', { class: 'card' },
+        h('div', { class: 'reg-acoes' },
+          h('button', { class: 'btn primario', id: 'btn-novo-negocio', type: 'button', onclick: () => iniciarVisita('NOVO') }, '➕ Novo negócio'),
+          h('button', { class: 'btn', id: 'btn-sync', type: 'button', onclick: () => { sincronizar(true); enviarPendentes(); } }, '↻ Atualizar')),
+        h('div', { class: 'ajuda', id: 'sync-info' }, textoSync())),
+      emAndamento ? h('div', { class: 'card em-andamento', id: 'card-andamento' }, h('h2', null, 'Visita em andamento'), h('div', null, nomeAndamento),
+        h('div', { class: 'reg-acoes' }, h('button', { class: 'btn primario pequeno', type: 'button', id: 'btn-continuar', onclick: () => iniciarVisita(S.draft.negocioSel) }, 'Continuar'),
+          h('button', { class: 'btn pequeno perigo', type: 'button', onclick: () => { descartarVisita(); } }, 'Descartar'))) : null,
+      venc.length ? h('div', { class: 'card alerta-acoes', id: 'card-vencidas' }, h('h2', null, 'Ações vencidas ou de hoje (' + venc.length + ')'),
+        venc.slice(0, 5).map((x) => h('button', { type: 'button', class: 'linha-acao', 'data-id': x.n.id, onclick: () => abrirFicha(x.n.id) },
+          h('strong', null, L.rotuloNegocio(x.n)),
+          h('span', null, (x.n.campos.proxima_acao || 'Próxima ação') + ' · ' + L.fmtDataBR(x.n.campos.proxima_acao_data) + ' ', tagData(x.n.campos.proxima_acao_data)))),
+        venc.length > 5 && !S.filtro.vencidas ? h('button', { class: 'link', type: 'button', onclick: () => { S.filtro.vencidas = true; renderLista(); } }, 'Ver todas (' + venc.length + ')') : null) : null,
+      h('div', { class: 'card filtros' }, busca,
+        h('div', { class: 'filtros-linha' }, selMun, selEt),
+        h('label', { class: 'check pequeno' }, chkV, h('span', null, 'Só ações vencidas ou de hoje')),
+        h('button', { class: 'link', type: 'button', id: 'btn-limpar-filtros', hidden: !filtroAtivo(), onclick: () => { S.filtro = { busca: '', municipio: '', etapa: '', vencidas: false }; renderLista(); } }, 'Limpar filtros')),
+      h('div', { class: 'ajuda', id: 'lista-contagem' }),
+      h('div', { id: 'lista-itens', class: 'lista-itens' }));
+    renderItensLista();
+  }
+
+  /* ---------- tela: Ficha do negócio (somente leitura) ---------- */
+  function abrirFicha(id) { S.fichaId = id; mostrarTela('ficha'); }
+  const linhaFicha = (rot, valor, extra) => (valor ? h('div', { class: 'lin' }, h('span', { class: 'k' }, rot), h('span', { class: 'v' }, valor, extra || null)) : null);
+  const numOuNull = (x) => (typeof x === 'number' && isFinite(x) ? x : null);
+
+  function cardProjeto(p) {
+    if (!p) return null;
+    const rs = L.valorPorHa(p);
+    const fatos = [];
+    if (numOuNull(p.area_ha) !== null) fatos.push(L.fmtNum(p.area_ha, 2) + ' ha');
+    if (numOuNull(p.lances) !== null) fatos.push(p.lances + ' lances');
+    if (numOuNull(p.n_pivos) !== null) fatos.push(p.n_pivos + (p.n_pivos === 1 ? ' pivô' : ' pivôs'));
+    if (numOuNull(p.n_recalques)) fatos.push(p.n_recalques + (p.n_recalques === 1 ? ' recalque' : ' recalques'));
+    if (numOuNull(p.n_equipamentos)) fatos.push(p.n_equipamentos + ' equipamento' + (p.n_equipamentos === 1 ? '' : 's'));
+    const origem = p.importado ? 'Valor importado do CRM atual (sem a planilha de equipamentos).'
+      : 'Projeto' + (p.versao ? ' v' + p.versao : '') + (p.data ? ' de ' + L.fmtDataBR(p.data) : '') + (p.tipo ? ' · ' + p.tipo : '');
+    return h('div', { class: 'card', id: 'ficha-projeto' }, h('h2', null, 'Projeto vigente'),
+      L.temValorProjeto(p) ? h('div', { class: 'proj-valores' },
+        h('div', null, h('div', { class: 'proj-rot' }, 'Valor total'), h('div', { class: 'proj-num', id: 'proj-valor' }, L.fmtReais(p.valor_total))),
+        h('div', null, h('div', { class: 'proj-rot' }, 'Custo por hectare'), h('div', { class: 'proj-num', id: 'proj-rsha' }, rs ? L.fmtReais(rs) + '/ha' : '—'))) : null,
+      fatos.length ? h('div', { class: 'proj-fatos' }, fatos.join(' · ')) : null,
+      h('div', { class: 'ajuda' }, origem));
+  }
+
+  function renderFicha() {
+    const raiz = $('#view-ficha');
+    const n = negocioPorId(S.fichaId);
+    const voltar = h('div', { class: 'barra-voltar' }, h('button', { class: 'btn pequeno', type: 'button', id: 'btn-ficha-voltar', onclick: () => mostrarTela('lista') }, '← Negócios'));
+    if (!n) { raiz.replaceChildren(voltar, h('div', { class: 'vazio' }, 'Negócio não encontrado neste aparelho.')); return; }
+    const c = n.campos || {};
+    const mapa = L.mapaLink(n.gps);
+    const datas = n.srv ? [n.primeira, n.ultima] : [n.regs.length ? n.regs[0].criadoEm : '', n.regs.length ? n.regs[n.regs.length - 1].criadoEm : ''];
+    const nVis = n.srv ? n.nVisitas : n.regs.length;
+    const def = (k) => L.campoPorChave(k);
+    const situacao = ['etapa', 'motivo', 'probabilidade', 'previsao_compra', 'concorrente', 'concorrente_nome', 'pagamento_tipo', 'pagamento_detalhe', 'tipo_sistema', 'segmentacao', 'origem', 'est_pivos', 'est_hectares']
+      .map((k) => linhaFicha(def(k).rotulo, L.textoCampo(def(k), c[k]))).filter(Boolean);
+    const conversa = ['assunto', 'observacoes'].map((k) => linhaFicha(def(k).rotulo, L.textoCampo(def(k), c[k]))).filter(Boolean);
+    const aviso = n.srv && n.regs.some((r) => !srvVisitasPorId()[r.id]) ? 'Há visita sua ainda não refletida pelo escritório; os campos já mostram o que você registrou.' : '';
+
+    montar(raiz, voltar,
+      h('div', { class: 'card' }, h('h2', null, 'Negócio'),
+        h('div', { class: 'ficha-nome', id: 'ficha-nome' }, L.rotuloNegocio(n)),
+        n.telefone ? h('div', { class: 'ficha-tel' }, h('a', { href: 'tel:' + String(n.telefone).replace(/[^\d+]/g, ''), id: 'ficha-tel' }, '📞 ' + n.telefone)) : null,
+        h('div', { class: 'ajuda' }, nVis + ' visita' + (nVis === 1 ? '' : 's') + (datas[0] ? ' · primeira ' + L.fmtDataBR(datas[0]) : '') + (datas[1] ? ' · última ' + L.fmtDataBR(datas[1]) : '')),
+        !n.srv ? h('div', { class: 'ajuda' }, 'Criado neste aparelho — aguardando o escritório liberar.') : null,
+        aviso ? h('div', { class: 'ajuda' }, aviso) : null,
+        h('div', { class: 'reg-acoes' },
+          h('button', { class: 'btn primario', id: 'btn-atualizar-negocio', type: 'button', onclick: () => iniciarVisita(n.id) }, 'Atualizar negócio'),
+          mapa ? h('a', { class: 'btn', id: 'btn-mapa', href: mapa, target: '_blank', rel: 'noopener' }, '📍 Abrir no mapa') : null)),
+      cardProjeto(n.projeto),
+      c.proxima_acao || c.proxima_acao_data ? h('div', { class: 'card', id: 'ficha-acao' }, h('h2', null, 'Próxima ação'),
+        h('div', null, c.proxima_acao || '—'), c.proxima_acao_data ? h('div', { class: 'ajuda' }, 'Para ' + L.fmtDataBR(c.proxima_acao_data) + ' ', tagData(c.proxima_acao_data)) : null) : null,
+      situacao.length ? h('div', { class: 'card' }, h('h2', null, 'Situação'), situacao) : null,
+      conversa.length ? h('div', { class: 'card' }, h('h2', null, 'Última conversa'), conversa) : null,
+      n.naoLiberadas.length ? h('div', { class: 'card', id: 'ficha-nao-liberadas' }, h('h2', null, 'Suas visitas ainda não liberadas'),
+        n.naoLiberadas.map((r) => { const st = L.statusVisita(r, srvVisitasPorId()[r.id]); return h('div', { class: 'lin' }, h('span', { class: 'k' }, new Date(r.criadoEm).toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' })), h('span', { class: 'v' }, h('span', { class: 'estado ' + st.tom }, st.texto))); })) : null,
+      n.historico.length ? h('div', { class: 'card', id: 'ficha-historico' }, h('h2', null, 'Histórico no escritório'),
+        n.historico.map((x) => h('div', { class: 'hist' }, h('div', { class: 'hist-cab' }, h('strong', null, x.tipo), ' · ' + x.quando + (x.vendedor ? ' · ' + x.vendedor : '')), h('div', { class: 'hist-texto' }, x.texto)))) : null);
+  }
+
+  /* ---------- tela: Histórico (visitas feitas neste aparelho + as que o escritório tem em seu nome) ---------- */
+  let urlsHist = [];
+  function itensHistorico() {
+    const mapa = srvVisitasPorId();
+    const ids = {};
+    S.registros.forEach((r) => { ids[r.id] = true; });
+    const locais = S.registros.map((r) => ({ r, sv: mapa[r.id], ms: Date.parse(r.criadoEm) || 0 }));
+    const soSrv = S.srv.visitas.filter((v) => !ids[v.id]).map((v) => ({ r: null, sv: v, ms: L.parseQuando(v.quando) }));
+    return locais.concat(soSrv).sort((a, b) => b.ms - a.ms);
+  }
+  function tituloVisitaSrv(sv) {
+    const n = negocioPorId(sv.negocio) || negocioPorId(sv.negocio_app);
+    const nome = n ? L.rotuloNegocio(n) : L.rotuloNegocio({ cliente: sv.cliente, fazenda: sv.fazenda, municipio: sv.municipio });
+    return nome;
+  }
+  function detalheVisita(it) {
+    const r = it.r, sv = it.sv;
+    const id = r ? r.id : sv.id;
+    const campos = Object.assign({}, r ? r.campos : {}, sv ? sv.campos : {}); // o texto do escritório vale
+    const linhas = [];
+    const ident = sv ? { cliente: sv.cliente, fazenda: sv.fazenda, municipio: sv.municipio } : (r ? r.identificacao : {}) || {};
+    if (r && r.prospectNovo) ['cliente', 'fazenda', 'municipio'].forEach((k) => linhas.push(linhaFicha(L.campoPorChave(k).rotulo, ident[k])));
+    L.CAMPOS.filter((c) => c.grupo !== 'ident' && c.tipo !== 'arquivo').forEach((d) => linhas.push(linhaFicha(d.rotulo, L.textoCampo(d, campos[d.key]))));
+    const caixaAudio = h('div', { class: 'aud', id: 'aud-' + id });
+    if (r && r.limpo) caixaAudio.append(h('div', { class: 'ajuda' }, 'Áudio e PDF já foram guardados no escritório e saíram do aparelho para liberar espaço; os textos continuam aqui.'));
+    else if (r && Object.keys(r.audios || {}).length) {
+      DB.arquivosDoRegistro(r.id).then((arqs) => {
+        arqs.filter((a) => /^audio/.test(a.mime || '')).forEach((a) => {
+          const chave = a.nome.replace(/^ident_/, '').replace(/\.[^.]+$/, '');
+          const d = L.campoPorChave(chave);
+          const u = URL.createObjectURL(a.blob); urlsHist.push(u);
+          caixaAudio.append(h('div', { class: 'ajuda' }, '🎤 ' + (d ? d.rotulo : chave)), h('audio', { controls: true, src: u, preload: 'metadata' }));
+        });
+      }).catch(() => {});
+    }
+    return h('div', { class: 'detalhe' }, linhas.filter(Boolean), caixaAudio);
+  }
+  function cardHist(it) {
+    const r = it.r, sv = it.sv;
+    const id = r ? r.id : sv.id;
+    const st = L.statusVisita(r, sv);
+    const aberto = S.histAberto === id;
+    const acoes = [h('button', { class: 'btn pequeno', type: 'button', 'data-acao': 'detalhe', onclick: () => { S.histAberto = aberto ? '' : id; renderHistorico(); } }, aberto ? 'Fechar' : 'Ver detalhes')];
+    if (r) {
+      if (r.status !== 'enviado') acoes.push(h('button', { class: 'btn pequeno primario', type: 'button', onclick: () => enviarPendentes(true) }, 'Enviar agora'));
+      acoes.push(h('button', {
+        class: 'btn pequeno perigo', type: 'button',
+        onclick: async () => {
+          if (!confirm(r.status === 'enviado' ? 'Excluir este registro do aparelho? (ele já foi enviado)' : 'Este registro ainda NÃO foi enviado. Excluir mesmo assim?')) return;
+          await DB.excluirRegistro(r.id);
+          S.registros = S.registros.filter((x) => x.id !== r.id);
+          recomputar(); renderTudo();
+        },
+      }, 'Excluir'));
+    }
+    const quando = r ? new Date(r.criadoEm).toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' }) : L.fmtQuando(sv.quando);
+    const meta = !r ? quando + ' · ' + (sv.origem === 'Escritório' ? 'lançada pelo escritório' : 'registrada antes, recuperada do escritório')
+      : r.origem === 'escritorio'
+        ? 'Lançamento do escritório · visita de ' + new Date(r.dataVisita).toLocaleDateString('pt-BR') + (r.dataVisitaSemHora ? '' : ' ' + new Date(r.dataVisita).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })) + ' · ' + L.fmtBytes(r.bytes || 0)
+        : quando + ' · ' + L.fmtBytes(r.bytes || 0) + (r.gps ? ' · GPS ±' + r.gps.acuraciaM + ' m' : r.presenca === 'distancia' ? ' · à distância' : ' · sem GPS') + (r.limpo ? ' · áudios já no escritório' : '');
+    return h('div', { class: 'card reg', 'data-id': id },
+      h('div', { class: 'reg-nome' }, r ? r.nomeRelatorio : tituloVisitaSrv(sv)),
       h('div', { class: 'reg-meta' }, meta),
-      h('div', null, h('span', { class: 'estado ' + st[0] }, st[1])),
-      r.ultimoErro && r.status !== 'enviado' ? h('div', { class: 'ajuda' }, 'Último erro: ' + r.ultimoErro) : null,
+      h('div', null, h('span', { class: 'estado ' + st.tom, 'data-status': st.codigo }, st.texto)),
+      sv && sv.a_conferir ? h('div', { class: 'ajuda' }, 'O escritório está conferindo alguns dados desta visita.') : null,
+      r && r.ultimoErro && r.status !== 'enviado' ? h('div', { class: 'ajuda' }, 'Último erro: ' + r.ultimoErro) : null,
+      aberto ? detalheVisita(it) : null,
       h('div', { class: 'reg-acoes' }, acoes));
   }
   function renderHistorico() {
     const raiz = $('#view-historico');
-    const regs = S.registros.slice().sort((a, b) => Date.parse(b.criadoEm) - Date.parse(a.criadoEm));
-    if (!regs.length) { raiz.replaceChildren(h('div', { class: 'vazio' }, 'Nenhum registro ainda.')); return; }
-    raiz.replaceChildren(...regs.map(cardReg));
+    urlsHist.forEach((u) => URL.revokeObjectURL(u)); urlsHist = [];
+    const itens = itensHistorico();
+    if (!itens.length) { raiz.replaceChildren(h('div', { class: 'vazio' }, 'Nenhum registro ainda.')); return; }
+    raiz.replaceChildren(...itens.map(cardHist));
   }
 
   /* ---------- tela: Config ---------- */
+  async function trocarVendedor(v) {
+    const mudou = !!(S.srv.meta && S.srv.meta.vendedor && !L.mesmoVendedor(S.srv.meta.vendedor, v));
+    S.vendedor = v; gravarCfg(); atualizarTopo();
+    if (mudou) { try { await DB.limparCarteira(); } catch (e) { /* segue */ } S.srv = { negocios: [], visitas: [], meta: null }; recomputar(); renderTudo(); }
+    S.sync.ultimaTentativa = 0;
+    sincronizar();
+  }
   function renderConfig() {
     const raiz = $('#view-config');
     const campoVend = S.vendedores.length
-      ? (() => { const s = h('select', { id: 'cfg-vendedor', onchange: (e) => { S.vendedor = e.target.value; gravarCfg(); atualizarTopo(); } },
+      ? (() => { const s = h('select', { id: 'cfg-vendedor', onchange: (e) => { trocarVendedor(e.target.value); } },
           h('option', { value: '' }, 'Escolha…'), S.vendedores.map((v) => h('option', { value: v }, v))); s.value = S.vendedor; return s; })()
-      : h('input', { type: 'text', id: 'cfg-vendedor', value: S.vendedor, placeholder: 'Seu nome', autocomplete: 'off', onchange: (e) => { S.vendedor = e.target.value.trim(); gravarCfg(); atualizarTopo(); } });
+      : h('input', { type: 'text', id: 'cfg-vendedor', value: S.vendedor, placeholder: 'Seu nome', autocomplete: 'off', onchange: (e) => { trocarVendedor(e.target.value.trim()); } });
     const ep = h('input', { type: 'url', id: 'cfg-endpoint', value: S.endpoint, placeholder: 'https://script.google.com/macros/s/…/exec', autocomplete: 'off' });
     const tk = h('input', { type: 'password', id: 'cfg-token', value: S.token, placeholder: 'Código de acesso', autocomplete: 'off' });
     const infoArm = h('div', { class: 'ajuda', id: 'cfg-armazenamento' }, 'Calculando…');
     const salvarCfgBtn = h('button', { class: 'btn primario', type: 'button', id: 'cfg-salvar', onclick: () => {
-      S.endpoint = ep.value.trim(); S.token = tk.value.trim(); gravarCfg(); toast('Configuração salva ✓'); enviarPendentes();
+      S.endpoint = ep.value.trim(); S.token = tk.value.trim(); gravarCfg(); toast('Configuração salva ✓'); enviarPendentes(); S.sync.ultimaTentativa = 0; sincronizar(true);
     } }, 'Salvar configuração');
     const teste = h('div', { class: 'ajuda', id: 'cfg-teste' });
     const modo = h('input', { type: 'checkbox', id: 'cfg-modo-escritorio', checked: S.modoEscritorio ? true : null, onchange: (e) => {
       S.modoEscritorio = e.target.checked; gravarCfg();
-      if (S.modoEscritorio) pararGPS(); else iniciarGPS();
+      if (S.modoEscritorio) pararGPS();
       renderTudo();
     } });
     raiz.replaceChildren(
       h('div', { class: 'card' }, h('h2', null, 'Vendedor'), campoVend),
+      h('div', { class: 'card' }, h('h2', null, 'Carteira do escritório'),
+        h('div', { class: 'ajuda', id: 'cfg-sync-info' }, textoSync()),
+        h('div', { class: 'reg-acoes' }, h('button', { class: 'btn', type: 'button', id: 'cfg-sync', onclick: () => { sincronizar(true); } }, '↻ Atualizar carteira agora')),
+        h('p', { class: 'ajuda' }, 'O aparelho se atualiza sozinho com o escritório (status das suas visitas, textos transcritos e os negócios da sua carteira). Sem sinal, tudo o que já veio continua disponível para consulta.')),
       h('div', { class: 'card' }, h('h2', null, 'Lançamento do escritório'),
         h('label', { class: 'check' }, modo, h('span', null, 'Lançar visita em nome de um vendedor')),
-        h('p', { class: 'ajuda' }, 'Para digitar no escritório uma visita que o vendedor contou: sem GPS, com o nome do vendedor e a data real da visita. Desligue para voltar ao modo de campo.')),
+        h('p', { class: 'ajuda' }, 'Para digitar no escritório uma visita que o vendedor contou: sem GPS, com o nome do vendedor e a data real da visita. Exige o código-mestre do escritório. Desligue para voltar ao modo de campo.')),
       h('div', { class: 'card' }, h('h2', null, 'Envio ao escritório'),
         h('div', { class: 'campo' }, h('div', { class: 'rotulo' }, 'Endereço do recebedor'), ep),
-        h('div', { class: 'campo' }, h('div', { class: 'rotulo' }, 'Código de acesso'), tk),
+        h('div', { class: 'campo' }, h('div', { class: 'rotulo' }, 'Código de acesso'), tk, h('div', { class: 'ajuda' }, 'Pessoal: é o código que o escritório entregou para o seu nome.')),
         h('div', { class: 'reg-acoes' }, salvarCfgBtn,
           h('button', { class: 'btn', type: 'button', onclick: async () => {
             S.endpoint = ep.value.trim(); S.token = tk.value.trim(); gravarCfg();
@@ -717,16 +1051,16 @@
             } catch (e) { teste.textContent = '✗ Sem resposta. Sem sinal ou endereço incorreto.'; }
           } }, 'Testar conexão'),
           h('button', { class: 'btn', type: 'button', onclick: async () => {
-            const link = location.origin + location.pathname + '#cfg=' + b64uEnc(JSON.stringify({ endpoint: S.endpoint, token: S.token, vendedores: S.vendedores }));
+            const link = location.origin + location.pathname + '#cfg=' + b64uEnc(JSON.stringify({ endpoint: S.endpoint, token: S.token, vendedor: S.vendedor, vendedores: S.vendedores }));
             try { await navigator.clipboard.writeText(link); toast('Link de configuração copiado.'); } catch (e) { prompt('Copie o link:', link); }
           } }, 'Copiar link de configuração')),
         teste,
-        h('p', { class: 'ajuda' }, 'O link de configuração leva endereço, código e lista de vendedores para outro aparelho. Envie só para quem vai usar o app.')),
+        h('p', { class: 'ajuda' }, 'O link de configuração leva endereço, nome e código de acesso para outro aparelho seu. Não envie para outra pessoa.')),
       h('div', { class: 'card' }, h('h2', null, 'Aparelho'),
         infoArm,
         h('div', { class: 'ajuda' }, 'Versão do app: ' + L.APP_VERSAO),
         S.instalar ? h('button', { class: 'btn', type: 'button', onclick: async () => { S.instalar.prompt(); S.instalar = null; renderConfig(); } }, 'Instalar app na tela inicial') : null,
-        h('p', { class: 'ajuda' }, 'Campos na tela: visita em negócio existente ' + L.contarCampos({}) + ' · prospect novo ' + L.contarCampos({ prospect: true }) +
+        h('p', { class: 'ajuda' }, 'Áudios e PDFs saem do aparelho sozinhos depois que o escritório libera a visita e devolve o texto. Campos na tela: visita em negócio existente ' + L.contarCampos({}) + ' · prospect novo ' + L.contarCampos({ prospect: true }) +
           ' · com opcionais ' + L.contarCampos({ prospect: true, opcionais: true }) + ' (+1 se a etapa for Ganho ou Perdido).'))
     );
     if (navigator.storage && navigator.storage.estimate) {
@@ -748,26 +1082,38 @@
     const pend = S.registros.filter((r) => r.status !== 'enviado').length;
     $('#topo-pendentes').textContent = S.enviando ? 'enviando…' : pend ? pend + ' pendente' + (pend > 1 ? 's' : '') : (S.registros.length ? 'tudo enviado ✓' : '');
   }
-  function mostrarAba(nome) {
-    S.aba = nome;
-    ['visita', 'historico', 'config'].forEach((a) => { $('#view-' + a).hidden = a !== nome; });
-    document.querySelectorAll('#abas button').forEach((b) => b.classList.toggle('ativa', b.dataset.aba === nome));
-    $('#barra-salvar').hidden = nome !== 'visita';
-    if (nome === 'historico') renderHistorico();
-    if (nome === 'config') renderConfig();
+  const TELAS = ['lista', 'ficha', 'visita', 'historico', 'config'];
+  const ABA_DA_TELA = { lista: 'negocios', ficha: 'negocios', visita: 'negocios', historico: 'historico', config: 'config' };
+  function renderTela() {
+    ({ lista: renderLista, ficha: renderFicha, visita: renderVisita, historico: renderHistorico, config: renderConfig }[S.tela] || renderLista)();
+  }
+  function mostrarTela(t) {
+    S.tela = t;
+    TELAS.forEach((x) => { $('#view-' + x).hidden = x !== t; });
+    document.querySelectorAll('#abas button').forEach((b) => b.classList.toggle('ativa', b.dataset.aba === ABA_DA_TELA[t]));
+    $('#barra-salvar').hidden = t !== 'visita';
+    atualizarTopo();
+    renderTela();
     window.scrollTo(0, 0);
   }
-  function renderTudo() { atualizarTopo(); renderVisita(); renderHistorico(); if (S.aba === 'config') renderConfig(); }
+  // não refaz a tela da visita no meio de uma gravação ou digitação: ela só muda por ações do próprio vendedor
+  function renderTudo() {
+    atualizarTopo();
+    if (S.tela === 'visita') return;
+    const foco = document.activeElement;
+    if (S.tela === 'lista' && foco && foco.id === 'busca') { renderItensLista(); renderSyncInfo(); return; } // não tira o teclado de quem está digitando
+    renderTela();
+  }
 
   function pedirVendedor() {
     const campo = S.vendedores.length
       ? (() => { const s = h('select', { id: 'modal-vendedor' }, h('option', { value: '' }, 'Escolha seu nome…'), S.vendedores.map((v) => h('option', { value: v }, v))); return s; })()
       : h('input', { type: 'text', id: 'modal-vendedor', placeholder: 'Seu nome completo', autocomplete: 'off' });
-    modal([h('h3', null, 'Quem é você?'), h('p', { class: 'ajuda' }, 'O nome vai na frente de cada relatório que você enviar.'), campo,
+    modal([h('h3', null, 'Quem é você?'), h('p', { class: 'ajuda' }, 'O nome vai na frente de cada relatório que você enviar. Use o mesmo nome cadastrado no escritório.'), campo,
       h('button', { class: 'btn primario', type: 'button', id: 'modal-vendedor-ok', onclick: () => {
         const v = campo.value.trim();
         if (!v) { toast('Informe seu nome.', 'erro'); return; }
-        S.vendedor = v; gravarCfg(); fecharModal(); atualizarTopo(); if (S.aba === 'config') renderConfig();
+        fecharModal(); trocarVendedor(v); if (S.tela === 'config') renderConfig();
       } }, 'Continuar')]);
   }
 
@@ -777,34 +1123,40 @@
     S.vendedor = c.vendedor || ''; S.endpoint = c.endpoint || ''; S.token = c.token || ''; S.vendedores = c.vendedores || []; S.modoEscritorio = !!c.modoEscritorio;
     const veioLink = aplicarLinkConfig();
     try { S.registros = await DB.todosRegistros(); } catch (e) { S.registros = []; toast('Armazenamento local indisponível neste navegador.', 'erro'); }
+    try {
+      const r = await Promise.all([DB.todos('negocios'), DB.todos('visitas_srv'), DB.get('meta', 'sync')]);
+      S.srv = { negocios: r[0] || [], visitas: r[1] || [], meta: r[2] || null };
+    } catch (e) { S.srv = { negocios: [], visitas: [], meta: null }; }
+    recomputar();
     try { S.draft = (await DB.get('rascunho', 'atual')) || novoDraft(); } catch (e) { S.draft = novoDraft(); }
     S.draft = Object.assign(novoDraft(), S.draft);
     S.draft.texto = Object.assign(novoDraft().texto, S.draft.texto);
-    if (S.draft.negocioSel && S.draft.negocioSel !== 'NOVO' && !L.listaNegocios(S.registros).some((n) => n.id === S.draft.negocioSel)) S.draft = novoDraft();
+    if (S.draft.negocioSel && S.draft.negocioSel !== 'NOVO' && !negocioPorId(S.draft.negocioSel)) S.draft = novoDraft();
 
-    document.querySelectorAll('#abas button').forEach((b) => b.addEventListener('click', () => mostrarAba(b.dataset.aba)));
+    document.querySelectorAll('#abas button').forEach((b) => b.addEventListener('click', () => mostrarTela(b.dataset.aba === 'negocios' ? 'lista' : b.dataset.aba)));
     $('#btn-salvar').addEventListener('click', salvar);
-    window.addEventListener('online', () => { atualizarTopo(); enviarPendentes(); });
+    window.addEventListener('online', () => { atualizarTopo(); enviarPendentes(); S.sync.ultimaTentativa = 0; sincronizar(); });
     window.addEventListener('offline', atualizarTopo);
-    window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); S.instalar = e; if (S.aba === 'config') renderConfig(); });
+    window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); S.instalar = e; if (S.tela === 'config') renderConfig(); });
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState !== 'visible') return;
-      if (!S.modoEscritorio && (!S.gps.best || Date.now() - S.gps.best.ts > 10 * 60000)) iniciarGPS();
+      if (S.tela === 'visita' && !S.modoEscritorio && S.draft.presenca !== 'distancia' && (!S.gps.best || Date.now() - S.gps.best.ts > 10 * 60000)) iniciarGPS();
       enviarPendentes();
+      sincronizarSePassou();
     });
-    setInterval(() => { if (navigator.onLine) enviarPendentes(); }, 90000);
+    setInterval(() => { if (navigator.onLine) { enviarPendentes(); sincronizarSePassou(); } }, 90000);
 
     if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
     if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
 
-    renderTudo();
-    mostrarAba('visita');
-    iniciarGPS();
+    await limparArquivosLiberados();
+    mostrarTela('lista');
     if (!S.vendedor && !S.modoEscritorio) pedirVendedor();
     if (veioLink) toast('Configuração recebida ✓');
     enviarPendentes();
+    sincronizar();
   }
 
-  window.__CRM = { S, DB, L }; // facilita testes e diagnóstico
+  window.__CRM = { S, DB, L, sincronizar, recomputar }; // facilita testes e diagnóstico
   iniciar();
 })();

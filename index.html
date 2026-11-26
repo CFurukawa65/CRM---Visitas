@@ -24,17 +24,19 @@
   </header>
 
   <main>
-    <section id="view-visita" class="view"></section>
+    <section id="view-lista" class="view"></section>
+    <section id="view-ficha" class="view" hidden></section>
+    <section id="view-visita" class="view" hidden></section>
     <section id="view-historico" class="view" hidden></section>
     <section id="view-config" class="view" hidden></section>
   </main>
 
-  <div id="barra-salvar" class="barra-salvar">
+  <div id="barra-salvar" class="barra-salvar" hidden>
     <button id="btn-salvar" class="btn grande primario" type="button">Salvar registro</button>
   </div>
 
   <nav class="abas" id="abas">
-    <button type="button" data-aba="visita" class="ativa">Visita</button>
+    <button type="button" data-aba="negocios" class="ativa">Negócios</button>
     <button type="button" data-aba="historico">Histórico</button>
     <button type="button" data-aba="config">Config</button>
   </nav>
