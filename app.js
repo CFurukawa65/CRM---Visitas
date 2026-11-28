@@ -1,7 +1,9 @@
 /* app.js — CRM Visitas · Copasul (PWA, funciona sem sinal)
  * Fluxo: lista de negócios (carteira do escritório) → ficha só de leitura → "Atualizar negócio" (ou "Novo negócio") → GPS → grava por voz
- * cada campo → salva → envia quando houver sinal. O aparelho se atualiza sozinho com o escritório (status, textos, carteira).
- * Modo "lançamento do escritório" (Config): sem GPS; informa o vendedor e a data real da visita. */
+ * cada campo → salva → envia quando houver sinal. O aparelho se atualiza sozinho com o escritório (status, textos, carteira e avisos).
+ * 1.3.0: só se exclui visita ainda não enviada; cliente e fazenda só digitados (município também por voz); etapas Prospecção e
+ * Prospecção descartada (com motivo); aviso "alterado pelo escritório" com botão Ciente. O lançamento pelo escritório saiu do app:
+ * agora é feito no app de Gestão (administrador/escritório). */
 (function () {
   'use strict';
   const L = window.Logic;
@@ -31,9 +33,10 @@
 
   /* ---------- estado ---------- */
   const S = {
-    vendedor: '', vendedores: [], endpoint: '', token: '', modoEscritorio: false,
+    vendedor: '', vendedores: [], endpoint: '', token: '',
     tela: 'lista', fichaId: '', draft: null, registros: [],
     srv: { negocios: [], visitas: [], meta: null }, lista: [],
+    avisos: [], vistos: {},
     filtro: { busca: '', municipio: '', etapa: '', vencidas: false },
     sync: { rodando: false, erro: '', aviso: '', ultimaTentativa: 0 },
     histAberto: '',
@@ -42,7 +45,7 @@
   };
   const novoDraft = () => ({
     negocioSel: '', valores: {}, texto: { cliente: '', fazenda: '', municipio: '', telefone: '' }, audios: {}, pdf: null,
-    lancandoEm: '', dataVisita: '', horaVisita: '', presenca: 'local', telefoneInicial: '',
+    presenca: 'local', telefoneInicial: '',
   });
   const temOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 
@@ -55,7 +58,7 @@
   const CFG_KEY = 'crmcopasul.cfg';
   function lerCfg() { try { return JSON.parse(localStorage.getItem(CFG_KEY) || '{}'); } catch (e) { return {}; } }
   function gravarCfg() {
-    try { localStorage.setItem(CFG_KEY, JSON.stringify({ vendedor: S.vendedor, endpoint: S.endpoint, token: S.token, vendedores: S.vendedores, modoEscritorio: S.modoEscritorio })); } catch (e) { /* sem storage */ }
+    try { localStorage.setItem(CFG_KEY, JSON.stringify({ vendedor: S.vendedor, endpoint: S.endpoint, token: S.token, vendedores: S.vendedores })); } catch (e) { /* sem storage */ }
   }
   const b64uEnc = (s) => btoa(unescape(encodeURIComponent(s))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   const b64uDec = (s) => decodeURIComponent(escape(atob(s.replace(/-/g, '+').replace(/_/g, '/'))));
@@ -76,7 +79,8 @@
 
   /* ---------- banco local (IndexedDB) ----------
    * v1: registros (visitas feitas aqui), arquivos (áudios/PDF), rascunho.
-   * v2: negocios + visitas_srv + meta = a carteira que veio do escritório (substituída inteira a cada atualização). */
+   * v2: negocios + visitas_srv + meta = a carteira que veio do escritório (substituída inteira a cada atualização).
+   *     meta também guarda 'avisos' (últimos avisos do escritório) e 'avisos_vistos' (ids com "Ciente"). */
   const DB = {
     _db: null,
     abrir() {
@@ -177,7 +181,7 @@
   }
   function iniciarGPS() {
     pararGPS();
-    if (S.modoEscritorio || S.draft.presenca === 'distancia') return; // lançamento do escritório e visita à distância não marcam ponto
+    if (S.draft.presenca === 'distancia') return; // visita à distância não marca ponto
     if (!('geolocation' in navigator)) { S.gps.status = 'indisponivel'; renderGps(); return; }
     S.gps.status = 'buscando';
     S.gps.best = null;
@@ -294,8 +298,16 @@
   /* ---------- valores atuais (último estado conhecido do negócio) ---------- */
   const atualDoNegocio = (id) => { const n = negocioPorId(id); return n ? n.campos : {}; };
   const negocioAtualMapa = () => (S.draft.negocioSel && S.draft.negocioSel !== 'NOVO' ? atualDoNegocio(S.draft.negocioSel) : {});
+  const etapaTocada = () => temOwn(S.draft.valores, 'etapa');
+  /** Trocar a etapa (para outra diferente da atual) invalida o motivo antigo: vale só o que for escolhido agora. */
+  const motivoAntigoInvalido = () => etapaTocada() && !temOwn(S.draft.valores, 'motivo') && S.draft.valores.etapa !== negocioAtualMapa().etapa;
+  function atualParaTela() {
+    const a = Object.assign({}, negocioAtualMapa());
+    if (motivoAntigoInvalido()) delete a.motivo;
+    return a;
+  }
   function valoresEfetivos() {
-    const ef = Object.assign({}, negocioAtualMapa());
+    const ef = atualParaTela();
     Object.keys(S.draft.valores).forEach((k) => { const v = S.draft.valores[k]; if (v === null) delete ef[k]; else ef[k] = v; });
     return ef;
   }
@@ -439,11 +451,17 @@
     const nota = av !== undefined && av !== null && av !== '' && !S.draft.audios[def.key] ? h('div', { class: 'atual', 'data-atual': def.key }, 'Atual: ' + L.textoCampo(def, av) + ' (mantido se você não gravar)') : null;
     return envolver(def, [widgetVoz(def), nota]);
   }
+  /** Município: digitado OU falado (o escritório completa a identificação do que for falado). */
   function campoTextoVoz(def) {
     return envolver(def, h('div', { class: 'texto-voz' },
-      h('input', { type: 'text', placeholder: def.exemplo, value: S.draft.texto[def.key], autocomplete: 'off', 'aria-label': def.rotulo,
+      h('input', { type: 'text', id: 'in-' + def.key, placeholder: def.exemplo, value: S.draft.texto[def.key], autocomplete: 'off', 'aria-label': def.rotulo,
         oninput: (e) => { S.draft.texto[def.key] = e.target.value; agendarRascunho(); } }),
       widgetVoz(def)));
+  }
+  /** Cliente e fazenda: só digitados. */
+  function campoTexto(def) {
+    return envolver(def, h('input', { type: 'text', id: 'in-' + def.key, placeholder: def.exemplo, value: S.draft.texto[def.key] || '', autocomplete: 'off', autocapitalize: 'words', 'aria-label': def.rotulo,
+      oninput: (e) => { S.draft.texto[def.key] = e.target.value; agendarRascunho(); } }));
   }
   /** Telefone: só digitado (teclado numérico), opcional. */
   function campoTelefone(def) {
@@ -455,6 +473,7 @@
     switch (def.tipo) {
       case 'voz': return campoVoz(def, atual);
       case 'texto_voz': return campoTextoVoz(def);
+      case 'texto': return campoTexto(def);
       case 'telefone': return campoTelefone(def);
       case 'opcoes': return campoOpcoes(def, ef, atual);
       case 'sim_nao': return campoSimNao(def, ef, atual);
@@ -471,10 +490,8 @@
     const outro = !!S.draft.negocioSel && S.draft.negocioSel !== id;
     if (outro && draftTemConteudo() && !confirm('Há uma visita em andamento em outro negócio. Descartar e começar esta?')) return;
     if (S.draft.negocioSel !== id) {
-      const { lancandoEm, dataVisita, horaVisita } = S.draft;
       liberarUrls();
       S.draft = novoDraft();
-      Object.assign(S.draft, { lancandoEm, dataVisita, horaVisita }); // no lançamento do escritório estes valem para a sequência
       S.draft.negocioSel = id;
       const n = id === 'NOVO' ? null : negocioPorId(id);
       if (n && n.telefone) { S.draft.texto.telefone = n.telefone; S.draft.telefoneInicial = n.telefone; }
@@ -492,8 +509,7 @@
     if (draftTemConteudo() && !confirm('Descartar o que já foi preenchido nesta visita?')) return;
     if (S.rec) await pararGravacao();
     liberarUrls(); pararGPS();
-    const { lancandoEm } = S.draft;
-    S.draft = Object.assign(novoDraft(), lancandoEm ? { lancandoEm } : {});
+    S.draft = novoDraft();
     agendarRascunho();
     mostrarTela('lista');
   }
@@ -524,7 +540,7 @@
     const n = novo ? null : negocioPorId(S.draft.negocioSel);
     const filhos = [h('h2', null, novo ? 'Novo negócio' : 'Atualizar negócio')];
     if (novo) {
-      filhos.push(h('p', { class: 'ajuda' }, 'Digite ou grave o nome. Se gravar, o escritório completa a identificação.'));
+      filhos.push(h('p', { class: 'ajuda' }, 'Digite o nome do cliente e da fazenda. O município pode ser digitado ou falado; se gravar, o escritório completa a identificação.'));
       L.CAMPOS.filter((c) => c.grupo === 'ident').forEach((def) => filhos.push(renderCampo(def, {}, {})));
     } else if (n) {
       filhos.push(h('div', { class: 'ident-fixa', id: 'ident-fixa' }, L.rotuloNegocio(n)),
@@ -546,28 +562,12 @@
     return det;
   }
 
-  /** Lançamento do escritório: em nome de quem, e quando a visita aconteceu de verdade. */
-  function cardLancamento() {
-    const lista = S.vendedores.length ? h('datalist', { id: 'lista-vendedores' }, S.vendedores.map((v) => h('option', { value: v }))) : null;
-    const em = h('input', { type: 'text', id: 'in-lancando-em', list: lista ? 'lista-vendedores' : null, value: S.draft.lancandoEm, placeholder: 'Nome do vendedor', autocomplete: 'off', 'aria-label': 'Lançando em nome de',
-      oninput: (e) => { S.draft.lancandoEm = e.target.value; agendarRascunho(); } });
-    const data = h('input', { type: 'date', id: 'in-data-visita', value: S.draft.dataVisita, 'aria-label': 'Data da visita',
-      onchange: (e) => { S.draft.dataVisita = e.target.value; agendarRascunho(); } });
-    const hora = h('input', { type: 'time', id: 'in-hora-visita', value: S.draft.horaVisita, 'aria-label': 'Hora da visita (opcional)',
-      onchange: (e) => { S.draft.horaVisita = e.target.value; agendarRascunho(); } });
-    return h('div', { class: 'card lancamento' }, h('h2', null, 'Lançamento do escritório'),
-      h('p', { class: 'ajuda' }, 'Sem GPS. A visita entra com a data real informada abaixo e já fica liberada.'),
-      h('div', { class: 'campo', 'data-campo': 'lancando_em' }, h('div', { class: 'rotulo' }, h('span', null, 'Lançando em nome de'), h('span', { class: 'obrig' }, 'obrigatório')), em, lista),
-      h('div', { class: 'campo', 'data-campo': 'data_visita' }, h('div', { class: 'rotulo' }, h('span', null, 'Data da visita'), h('span', { class: 'obrig' }, 'obrigatório')), data),
-      h('div', { class: 'campo', 'data-campo': 'hora_visita' }, h('div', { class: 'rotulo' }, h('span', null, 'Hora (opcional)')), hora));
-  }
-
   function renderVisita() {
     const raiz = $('#view-visita');
     if (!S.draft.negocioSel) { raiz.replaceChildren(h('div', { class: 'vazio' }, 'Escolha um negócio na aba Negócios.')); return; }
     const ef = valoresEfetivos();
-    const atual = negocioAtualMapa();
-    raiz.replaceChildren(cardTopoVisita(), S.modoEscritorio ? cardLancamento() : cardLocal(), cardNegocio(), cardRelatorio(ef, atual), cardOpcionais(ef, atual));
+    const atual = atualParaTela();
+    raiz.replaceChildren(cardTopoVisita(), cardLocal(), cardNegocio(), cardRelatorio(ef, atual), cardOpcionais(ef, atual));
     renderGps();
   }
 
@@ -579,17 +579,15 @@
 
   async function salvar() {
     if (S.rec) await pararGravacao();
-    const escritorio = S.modoEscritorio;
-    const erros = L.validarRegistro(Object.assign({}, S.draft, { modo: escritorio ? 'escritorio' : 'campo' }));
+    const ef = valoresEfetivos();
+    const erros = L.validarRegistro(Object.assign({}, S.draft, { valores: ef, etapaTocada: etapaTocada() }));
     if (erros.length) { mostrarErros(erros); return; }
-    if (!escritorio && !S.vendedor) { pedirVendedor(); return; }
+    if (!S.vendedor) { pedirVendedor(); return; }
     const btn = $('#btn-salvar');
     btn.disabled = true;
     try {
       const agora = new Date();
-      const vendedor = escritorio ? S.draft.lancandoEm.trim() : S.vendedor;
-      const dh = escritorio ? L.dataHoraVisita(S.draft.dataVisita, S.draft.horaVisita) : null;
-      const quando = dh ? dh.data : agora;
+      const vendedor = S.vendedor;
       const novo = S.draft.negocioSel === 'NOVO';
       const negocioId = novo ? L.gerarCodigoProvisorio(agora) : S.draft.negocioSel;
       const conhecido = novo ? null : negocioPorId(negocioId);
@@ -598,7 +596,6 @@
       const ident = novo
         ? { cliente: S.draft.texto.cliente.trim(), fazenda: S.draft.texto.fazenda.trim(), municipio: S.draft.texto.municipio.trim(), telefone: tel }
         : { cliente: conhecido.cliente, fazenda: conhecido.fazenda, municipio: conhecido.municipio, telefone: tel && tel !== (S.draft.telefoneInicial || '') ? tel : '' };
-      const ef = valoresEfetivos();
       const visiveis = L.CAMPOS.filter((c) => (novo || c.grupo !== 'ident') && L.campoVisivel(c, ef));
       const id = L.gerarId();
       const arquivos = [];
@@ -619,11 +616,13 @@
       }
       const campos = {};
       visiveis.forEach((def) => { if (def.grupo !== 'ident' && temOwn(S.draft.valores, def.key)) campos[def.key] = S.draft.valores[def.key]; });
-      const aDistancia = !escritorio && S.draft.presenca === 'distancia';
-      const b = escritorio || aDistancia ? null : S.gps.best; // à distância: sem GPS, para não mover o ponto do negócio
+      // trocar a etapa invalida o motivo antigo (ex.: reabrir um GANHO): apaga no escritório para ele não ficar colado na etapa nova
+      if (!novo && motivoAntigoInvalido() && atualDoNegocio(negocioId).motivo !== undefined && !temOwn(campos, 'motivo')) campos.motivo = null;
+      const aDistancia = S.draft.presenca === 'distancia';
+      const b = aDistancia ? null : S.gps.best; // à distância: sem GPS, para não mover o ponto do negócio
       const reg = {
         esquema: 1, id, versaoApp: L.APP_VERSAO,
-        nomeRelatorio: L.nomeRelatorio({ vendedor, cliente: ident.cliente, fazenda: ident.fazenda, municipio: ident.municipio, data: quando }),
+        nomeRelatorio: L.nomeRelatorio({ vendedor, cliente: ident.cliente, fazenda: ident.fazenda, municipio: ident.municipio, data: agora }),
         vendedor, criadoEm: agora.toISOString(), negocioId, prospectNovo: novo,
         identificacao: { cliente: ident.cliente, fazenda: ident.fazenda, municipio: ident.municipio, telefone: ident.telefone, porVoz },
         gps: b ? { lat: b.lat, lng: b.lng, acuraciaM: Math.round(b.acc), capturadoEm: new Date(b.ts).toISOString() } : null,
@@ -631,21 +630,14 @@
         status: 'pendente', enviados: {}, tentativas: 0, ultimoErro: '', bytes: arquivos.reduce((s, a) => s + a.bytes, 0),
       };
       if (aDistancia) reg.presenca = 'distancia';
-      if (escritorio) {
-        reg.origem = 'escritorio';
-        reg.lancadoPor = S.vendedor || 'Escritório';
-        reg.dataVisita = dh.iso;
-        reg.dataVisitaSemHora = dh.semHora;
-      }
       await DB.salvarRegistro(reg, arquivos);
       S.registros.push(reg);
       recomputar();
       liberarUrls();
       pararGPS();
-      const mantem = escritorio ? { lancandoEm: S.draft.lancandoEm } : {};
-      S.draft = Object.assign(novoDraft(), mantem);
+      S.draft = novoDraft();
       await DB.put('rascunho', S.draft, 'atual');
-      toast(escritorio ? 'Lançamento salvo ✓ — pendente de envio' : aDistancia ? 'Registro salvo (à distância, sem GPS) ✓ — pendente de envio' : b ? 'Registro salvo ✓ — pendente de envio' : 'Registro salvo SEM ponto GPS — pendente de envio');
+      toast(aDistancia ? 'Registro salvo (à distância, sem GPS) ✓ — pendente de envio' : b ? 'Registro salvo ✓ — pendente de envio' : 'Registro salvo SEM ponto GPS — pendente de envio');
       atualizarTopo();
       if (!novo) { S.fichaId = negocioId; mostrarTela('ficha'); } else mostrarTela('lista');
       enviarPendentes();
@@ -701,6 +693,12 @@
     }
   }
 
+  /** Atualiza o que mostra o estado do envio (topo, Histórico e a lista "não liberadas" da ficha aberta). */
+  function refrescarEnvio() {
+    atualizarTopo(); renderHistorico();
+    if (S.tela === 'ficha') renderFicha();
+  }
+
   async function enviarPendentes(manual) {
     if (S.enviando) return;
     const fila = S.registros.filter((r) => r.status !== 'enviado').sort((a, b) => Date.parse(a.criadoEm) - Date.parse(b.criadoEm));
@@ -710,7 +708,7 @@
     let ok = 0, falhas = 0;
     for (const reg of fila) {
       reg.status = 'enviando';
-      atualizarTopo(); renderHistorico();
+      refrescarEnvio();
       try {
         await enviarRegistro(reg);
         reg.status = 'enviado'; reg.enviadoEm = new Date().toISOString(); reg.ultimoErro = ''; ok++;
@@ -723,7 +721,7 @@
       await DB.put('registros', reg);
     }
     S.enviando = false;
-    atualizarTopo(); renderHistorico();
+    refrescarEnvio();
     if (ok) toast(ok + ' registro(s) enviado(s) ✓');
     else if (falhas && manual) toast('Não enviou: ' + (fila[0].ultimoErro || 'sem conexão'), 'erro');
   }
@@ -742,12 +740,13 @@
 
   async function sincronizar(manual) {
     if (S.sync.rodando) return;
-    if (S.modoEscritorio) { if (manual) toast('No modo escritório não há carteira.'); return; }
     if (!S.endpoint || !S.token || !S.vendedor) { if (manual) toast('Informe o endereço, o seu nome e o código de acesso em Config.', 'erro'); return; }
     if (!navigator.onLine) { if (manual) toast('Sem sinal. Mostrando o que está salvo no aparelho.', 'erro'); return; }
     S.sync.rodando = true; S.sync.erro = ''; renderSyncInfo();
     try {
       const j = await postar({ acao: 'carteira' });
+      // avisos de alteração (recebedor 1.2.0 em diante; recebedor antigo não manda o campo e os avisos já guardados ficam)
+      if (Array.isArray(j.avisos)) { S.avisos = j.avisos; DB.put('meta', j.avisos, 'avisos').catch(() => {}); }
       if (j.carteira && L.mesmoVendedor(j.carteira.vendedor, S.vendedor)) {
         const negocios = j.carteira.negocios || [], visitas = j.carteira.visitas || [];
         const meta = { quando: new Date().toISOString(), geradoEm: j.carteira.gerado_em || '', versaoProc: j.carteira.versao_proc || '', vendedor: S.vendedor };
@@ -781,6 +780,37 @@
     return n;
   }
 
+  /* ---------- avisos de alteração (escritório/administrador) com "Ciente" ---------- */
+  const avisosPend = () => L.avisosPendentes(S.avisos, S.vistos);
+  const negocioDoAviso = (a) => S.lista.find((n) => L.avisosDoNegocio([a], n).length) || null;
+  function marcarCiente(ids) {
+    (Array.isArray(ids) ? ids : [ids]).forEach((id) => { S.vistos[id] = true; });
+    const lista = Object.keys(S.vistos).slice(-400);
+    S.vistos = {};
+    lista.forEach((k) => { S.vistos[k] = true; });
+    DB.put('meta', lista, 'avisos_vistos').catch(() => {});
+    renderTudo();
+  }
+  function linhaAviso(a, comNegocio) {
+    const t = L.textoAviso(a);
+    const n = comNegocio ? negocioDoAviso(a) : null;
+    return h('div', { class: 'linha-acao aviso', 'data-aviso': a.id },
+      comNegocio ? h('strong', null, n ? L.rotuloNegocio(n) : (a.rotulo || 'Negócio')) : null,
+      h('span', null, t.titulo + (t.quando ? ' · ' + t.quando : '')),
+      t.detalhe ? h('span', null, t.detalhe) : null,
+      h('div', { class: 'reg-acoes' },
+        n ? h('button', { class: 'btn pequeno', type: 'button', 'data-acao': 'ver-negocio', onclick: () => abrirFicha(n.id) }, 'Ver negócio') : null,
+        h('button', { class: 'btn pequeno primario', type: 'button', 'data-acao': 'ciente', onclick: () => marcarCiente(a.id) }, 'Ciente')));
+  }
+  function cardAvisos(avisos, o) {
+    if (!avisos.length) return null;
+    const vis = o.limite ? avisos.slice(0, o.limite) : avisos;
+    return h('div', { class: 'card em-andamento', id: o.id },
+      h('h2', null, o.titulo + ' (' + avisos.length + ')'),
+      vis.map((a) => linhaAviso(a, o.comNegocio)),
+      avisos.length > 1 ? h('button', { class: 'link', type: 'button', 'data-acao': 'ciente-todos', onclick: () => marcarCiente(avisos.map((a) => a.id)) }, 'Ciente em todos (' + avisos.length + ')') : null);
+  }
+
   /** Troca o conteúdo de uma tela ignorando itens nulos (replaceChildren escreveria a palavra "null"). */
   function montar(raiz) { raiz.replaceChildren(...Array.prototype.slice.call(arguments, 1).filter((x) => x)); }
 
@@ -799,10 +829,12 @@
     const c = n.campos || {};
     const proj = linhaProjeto(n.projeto);
     const aguardando = !n.srv;
+    const nAvisos = L.avisosDoNegocio(avisosPend(), n).length;
     return h('button', { type: 'button', class: 'neg', 'data-id': n.id, onclick: () => abrirFicha(n.id) },
       h('div', { class: 'neg-nome' }, L.rotuloNegocio(n)),
       h('div', { class: 'neg-linha' },
         c.etapa ? h('span', { class: 'estado' }, L.rotuloEtapa(c.etapa)) : null,
+        nAvisos ? h('span', { class: 'estado atencao', 'data-selo': 'alterado' }, 'alterado pelo escritório') : null,
         aguardando ? h('span', { class: 'estado atencao' }, 'aguardando liberação') : null,
         n.srv && n.naoLiberadas.length ? h('span', { class: 'estado atencao' }, n.naoLiberadas.length + ' visita' + (n.naoLiberadas.length > 1 ? 's' : '') + ' não liberada' + (n.naoLiberadas.length > 1 ? 's' : '')) : null),
       proj ? h('div', { class: 'neg-proj' }, proj) : null,
@@ -848,6 +880,7 @@
           h('button', { class: 'btn primario', id: 'btn-novo-negocio', type: 'button', onclick: () => iniciarVisita('NOVO') }, '➕ Novo negócio'),
           h('button', { class: 'btn', id: 'btn-sync', type: 'button', onclick: () => { sincronizar(true); enviarPendentes(); } }, '↻ Atualizar')),
         h('div', { class: 'ajuda', id: 'sync-info' }, textoSync())),
+      cardAvisos(avisosPend(), { id: 'card-avisos', titulo: 'Avisos do escritório', comNegocio: true, limite: 5 }),
       emAndamento ? h('div', { class: 'card em-andamento', id: 'card-andamento' }, h('h2', null, 'Visita em andamento'), h('div', null, nomeAndamento),
         h('div', { class: 'reg-acoes' }, h('button', { class: 'btn primario pequeno', type: 'button', id: 'btn-continuar', onclick: () => iniciarVisita(S.draft.negocioSel) }, 'Continuar'),
           h('button', { class: 'btn pequeno perigo', type: 'button', onclick: () => { descartarVisita(); } }, 'Descartar'))) : null,
@@ -914,6 +947,7 @@
         h('div', { class: 'reg-acoes' },
           h('button', { class: 'btn primario', id: 'btn-atualizar-negocio', type: 'button', onclick: () => iniciarVisita(n.id) }, 'Atualizar negócio'),
           mapa ? h('a', { class: 'btn', id: 'btn-mapa', href: mapa, target: '_blank', rel: 'noopener' }, '📍 Abrir no mapa') : null)),
+      cardAvisos(L.avisosDoNegocio(avisosPend(), n), { id: 'ficha-avisos', titulo: 'Alterações do escritório neste negócio', comNegocio: false }),
       cardProjeto(n.projeto),
       c.proxima_acao || c.proxima_acao_data ? h('div', { class: 'card', id: 'ficha-acao' }, h('h2', null, 'Próxima ação'),
         h('div', null, c.proxima_acao || '—'), c.proxima_acao_data ? h('div', { class: 'ajuda' }, 'Para ' + L.fmtDataBR(c.proxima_acao_data) + ' ', tagData(c.proxima_acao_data)) : null) : null,
@@ -960,7 +994,8 @@
         });
       }).catch(() => {});
     }
-    return h('div', { class: 'detalhe' }, linhas.filter(Boolean), caixaAudio);
+    return h('div', { class: 'detalhe' }, linhas.filter(Boolean), caixaAudio,
+      r && !L.podeExcluirRegistro(r) ? h('div', { class: 'ajuda', id: 'aviso-sem-excluir' }, 'Esta visita já foi enviada ao escritório; só o escritório pode excluí-la.') : null);
   }
   function cardHist(it) {
     const r = it.r, sv = it.sv;
@@ -970,15 +1005,19 @@
     const acoes = [h('button', { class: 'btn pequeno', type: 'button', 'data-acao': 'detalhe', onclick: () => { S.histAberto = aberto ? '' : id; renderHistorico(); } }, aberto ? 'Fechar' : 'Ver detalhes')];
     if (r) {
       if (r.status !== 'enviado') acoes.push(h('button', { class: 'btn pequeno primario', type: 'button', onclick: () => enviarPendentes(true) }, 'Enviar agora'));
-      acoes.push(h('button', {
-        class: 'btn pequeno perigo', type: 'button',
-        onclick: async () => {
-          if (!confirm(r.status === 'enviado' ? 'Excluir este registro do aparelho? (ele já foi enviado)' : 'Este registro ainda NÃO foi enviado. Excluir mesmo assim?')) return;
-          await DB.excluirRegistro(r.id);
-          S.registros = S.registros.filter((x) => x.id !== r.id);
-          recomputar(); renderTudo();
-        },
-      }, 'Excluir'));
+      // só se exclui o que o escritório ainda não recebeu
+      if (L.podeExcluirRegistro(r)) {
+        acoes.push(h('button', {
+          class: 'btn pequeno perigo', type: 'button', 'data-acao': 'excluir',
+          onclick: async () => {
+            if (!L.podeExcluirRegistro(r)) { toast('Este registro já está sendo enviado ou foi enviado; não dá mais para excluir.', 'erro'); renderHistorico(); return; }
+            if (!confirm('Este registro ainda NÃO foi enviado ao escritório. Excluir mesmo assim? Não dá para desfazer.')) return;
+            await DB.excluirRegistro(r.id);
+            S.registros = S.registros.filter((x) => x.id !== r.id);
+            recomputar(); renderTudo();
+          },
+        }, 'Excluir'));
+      }
     }
     const quando = r ? new Date(r.criadoEm).toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' }) : L.fmtQuando(sv.quando);
     const meta = !r ? quando + ' · ' + (sv.origem === 'Escritório' ? 'lançada pelo escritório' : 'registrada antes, recuperada do escritório')
@@ -1006,7 +1045,7 @@
   async function trocarVendedor(v) {
     const mudou = !!(S.srv.meta && S.srv.meta.vendedor && !L.mesmoVendedor(S.srv.meta.vendedor, v));
     S.vendedor = v; gravarCfg(); atualizarTopo();
-    if (mudou) { try { await DB.limparCarteira(); } catch (e) { /* segue */ } S.srv = { negocios: [], visitas: [], meta: null }; recomputar(); renderTudo(); }
+    if (mudou) { try { await DB.limparCarteira(); } catch (e) { /* segue */ } S.srv = { negocios: [], visitas: [], meta: null }; S.avisos = []; S.vistos = {}; recomputar(); renderTudo(); }
     S.sync.ultimaTentativa = 0;
     sincronizar();
   }
@@ -1023,20 +1062,12 @@
       S.endpoint = ep.value.trim(); S.token = tk.value.trim(); gravarCfg(); toast('Configuração salva ✓'); enviarPendentes(); S.sync.ultimaTentativa = 0; sincronizar(true);
     } }, 'Salvar configuração');
     const teste = h('div', { class: 'ajuda', id: 'cfg-teste' });
-    const modo = h('input', { type: 'checkbox', id: 'cfg-modo-escritorio', checked: S.modoEscritorio ? true : null, onchange: (e) => {
-      S.modoEscritorio = e.target.checked; gravarCfg();
-      if (S.modoEscritorio) pararGPS();
-      renderTudo();
-    } });
     raiz.replaceChildren(
       h('div', { class: 'card' }, h('h2', null, 'Vendedor'), campoVend),
       h('div', { class: 'card' }, h('h2', null, 'Carteira do escritório'),
         h('div', { class: 'ajuda', id: 'cfg-sync-info' }, textoSync()),
         h('div', { class: 'reg-acoes' }, h('button', { class: 'btn', type: 'button', id: 'cfg-sync', onclick: () => { sincronizar(true); } }, '↻ Atualizar carteira agora')),
-        h('p', { class: 'ajuda' }, 'O aparelho se atualiza sozinho com o escritório (status das suas visitas, textos transcritos e os negócios da sua carteira). Sem sinal, tudo o que já veio continua disponível para consulta.')),
-      h('div', { class: 'card' }, h('h2', null, 'Lançamento do escritório'),
-        h('label', { class: 'check' }, modo, h('span', null, 'Lançar visita em nome de um vendedor')),
-        h('p', { class: 'ajuda' }, 'Para digitar no escritório uma visita que o vendedor contou: sem GPS, com o nome do vendedor e a data real da visita. Exige o código-mestre do escritório. Desligue para voltar ao modo de campo.')),
+        h('p', { class: 'ajuda' }, 'O aparelho se atualiza sozinho com o escritório (status das suas visitas, textos transcritos, avisos de alteração e os negócios da sua carteira). Sem sinal, tudo o que já veio continua disponível para consulta.')),
       h('div', { class: 'card' }, h('h2', null, 'Envio ao escritório'),
         h('div', { class: 'campo' }, h('div', { class: 'rotulo' }, 'Endereço do recebedor'), ep),
         h('div', { class: 'campo' }, h('div', { class: 'rotulo' }, 'Código de acesso'), tk, h('div', { class: 'ajuda' }, 'Pessoal: é o código que o escritório entregou para o seu nome.')),
@@ -1060,8 +1091,8 @@
         infoArm,
         h('div', { class: 'ajuda' }, 'Versão do app: ' + L.APP_VERSAO),
         S.instalar ? h('button', { class: 'btn', type: 'button', onclick: async () => { S.instalar.prompt(); S.instalar = null; renderConfig(); } }, 'Instalar app na tela inicial') : null,
-        h('p', { class: 'ajuda' }, 'Áudios e PDFs saem do aparelho sozinhos depois que o escritório libera a visita e devolve o texto. Campos na tela: visita em negócio existente ' + L.contarCampos({}) + ' · prospect novo ' + L.contarCampos({ prospect: true }) +
-          ' · com opcionais ' + L.contarCampos({ prospect: true, opcionais: true }) + ' (+1 se a etapa for Ganho ou Perdido).'))
+        h('p', { class: 'ajuda' }, 'Áudios e PDFs saem do aparelho sozinhos depois que o escritório libera a visita e devolve o texto. Campos na tela: visita em negócio existente ' + L.contarCampos({}) + ' · negócio novo ' + L.contarCampos({ prospect: true }) +
+          ' · com opcionais ' + L.contarCampos({ prospect: true, opcionais: true }) + ' (+1 se a etapa for Ganho, Perdido ou Prospecção descartada).'))
     );
     if (navigator.storage && navigator.storage.estimate) {
       navigator.storage.estimate().then((e) => {
@@ -1077,10 +1108,15 @@
     const pill = $('#pill-rede');
     pill.textContent = online ? 'online' : 'sem sinal';
     pill.className = 'pill' + (online ? '' : ' offline');
-    $('#topo-vendedor').textContent = S.modoEscritorio ? 'MODO ESCRITÓRIO — lançamento' : (S.vendedor || 'defina o vendedor em Config');
-    document.body.classList.toggle('modo-escritorio', !!S.modoEscritorio);
+    $('#topo-vendedor').textContent = S.vendedor || 'defina o vendedor em Config';
     const pend = S.registros.filter((r) => r.status !== 'enviado').length;
     $('#topo-pendentes').textContent = S.enviando ? 'enviando…' : pend ? pend + ' pendente' + (pend > 1 ? 's' : '') : (S.registros.length ? 'tudo enviado ✓' : '');
+    const abaNeg = document.querySelector('#abas button[data-aba=negocios]');
+    if (abaNeg) {
+      const na = avisosPend().length;
+      abaNeg.textContent = na ? 'Negócios (' + na + ')' : 'Negócios';
+      abaNeg.title = na ? na + ' aviso' + (na > 1 ? 's' : '') + ' do escritório' : '';
+    }
   }
   const TELAS = ['lista', 'ficha', 'visita', 'historico', 'config'];
   const ABA_DA_TELA = { lista: 'negocios', ficha: 'negocios', visita: 'negocios', historico: 'historico', config: 'config' };
@@ -1120,13 +1156,16 @@
   /* ---------- início ---------- */
   async function iniciar() {
     const c = lerCfg();
-    S.vendedor = c.vendedor || ''; S.endpoint = c.endpoint || ''; S.token = c.token || ''; S.vendedores = c.vendedores || []; S.modoEscritorio = !!c.modoEscritorio;
+    S.vendedor = c.vendedor || ''; S.endpoint = c.endpoint || ''; S.token = c.token || ''; S.vendedores = c.vendedores || [];
     const veioLink = aplicarLinkConfig();
     try { S.registros = await DB.todosRegistros(); } catch (e) { S.registros = []; toast('Armazenamento local indisponível neste navegador.', 'erro'); }
     try {
-      const r = await Promise.all([DB.todos('negocios'), DB.todos('visitas_srv'), DB.get('meta', 'sync')]);
+      const r = await Promise.all([DB.todos('negocios'), DB.todos('visitas_srv'), DB.get('meta', 'sync'), DB.get('meta', 'avisos'), DB.get('meta', 'avisos_vistos')]);
       S.srv = { negocios: r[0] || [], visitas: r[1] || [], meta: r[2] || null };
-    } catch (e) { S.srv = { negocios: [], visitas: [], meta: null }; }
+      S.avisos = Array.isArray(r[3]) ? r[3] : [];
+      S.vistos = {};
+      (Array.isArray(r[4]) ? r[4] : []).forEach((k) => { S.vistos[k] = true; });
+    } catch (e) { S.srv = { negocios: [], visitas: [], meta: null }; S.avisos = []; S.vistos = {}; }
     recomputar();
     try { S.draft = (await DB.get('rascunho', 'atual')) || novoDraft(); } catch (e) { S.draft = novoDraft(); }
     S.draft = Object.assign(novoDraft(), S.draft);
@@ -1140,7 +1179,7 @@
     window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); S.instalar = e; if (S.tela === 'config') renderConfig(); });
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState !== 'visible') return;
-      if (S.tela === 'visita' && !S.modoEscritorio && S.draft.presenca !== 'distancia' && (!S.gps.best || Date.now() - S.gps.best.ts > 10 * 60000)) iniciarGPS();
+      if (S.tela === 'visita' && S.draft.presenca !== 'distancia' && (!S.gps.best || Date.now() - S.gps.best.ts > 10 * 60000)) iniciarGPS();
       enviarPendentes();
       sincronizarSePassou();
     });
@@ -1151,7 +1190,7 @@
 
     await limparArquivosLiberados();
     mostrarTela('lista');
-    if (!S.vendedor && !S.modoEscritorio) pedirVendedor();
+    if (!S.vendedor) pedirVendedor();
     if (veioLink) toast('Configuração recebida ✓');
     enviarPendentes();
     sincronizar();
