@@ -6,12 +6,16 @@
 })(typeof self !== 'undefined' ? self : this, function () {
   'use strict';
 
-  const APP_VERSAO = '1.2.0';
+  const APP_VERSAO = '1.3.0';
   const MESES = ['jan', 'fev', 'mar', 'abr', 'mai', 'jun', 'jul', 'ago', 'set', 'out', 'nov', 'dez'];
 
   /* ---------- listas fechadas (vindas do CRM atual) ---------- */
   // GANHO / PERDIDO / 0-Arquivado: o escritório converte para a etapa/conclusão do CRM atual.
+  // Prospecção: primeiro contato, antes da "Oportunidade mapeada". "Prospecção descartada": a prospecção não avançou (exige motivo).
+  const ETAPA_PROSPECCAO = 'Prospecção';
+  const ETAPA_DESCARTADA = 'Prospecção descartada';
   const ETAPAS = [
+    { v: ETAPA_PROSPECCAO, t: 'Prospecção' },
     { v: '1-Oportunidade Mapeada', t: 'Oportunidade mapeada' },
     { v: '5-Projeto Pronto', t: 'Projeto pronto' },
     { v: '6-Apresentação realizada', t: 'Apresentação realizada' },
@@ -19,9 +23,11 @@
     { v: 'GANHO', t: 'Ganho (fechou)' },
     { v: 'PERDIDO', t: 'Perdido' },
     { v: '0-Arquivado', t: 'Arquivar' },
+    { v: ETAPA_DESCARTADA, t: 'Prospecção descartada' },
   ];
   const MOTIVOS_GANHO = ['Parcelamento RP', 'Preferência pela Marca', 'Qualidade de Projeto', 'Preço', 'Condições de Pagamento', 'Prazo de Entrega'];
   const MOTIVOS_PERDA = ['Preço', 'Problema de relacionamento', 'Preferência por Marca', 'Falta de Atendimento'];
+  const MOTIVOS_DESCARTE = ['Sem interesse no momento', 'Sem área ou água viável', 'Já tem sistema ou concorrente', 'Sem retorno do contato', 'Outro'];
   const ORIGENS = ['Carteira de vendas', 'Indicação de parceiros', 'Canais Digitais', 'Eventos', 'Campanha Fábrica', 'Marketing'];
   const SEGMENTOS = ['Grãos', 'Pecuária', 'Cana'];
   const TIPOS_SISTEMA = ['Pivô central', 'Carretel', 'Aspersão', 'Outro'];
@@ -31,18 +37,19 @@
   /* ---------- definição dos campos ----------
    * tipo: texto_voz | texto | telefone | voz | opcoes | estrelas | mes | data | sim_nao | multi | arquivo
    * max: duração máxima da gravação (s). obrigatorio: exige preenchimento para salvar.
-   * numero: o campo dita só o número (o escritório grava como número). */
+   * numero: o campo dita só o número (o escritório grava como número).
+   * grupo 'legado': não aparece mais no formulário; continua sendo lido para mostrar o que já foi registrado. */
   const CAMPOS = [
-    // identificação (só "Novo prospect"): digitado OU por voz; telefone sempre digitado e opcional
-    { key: 'cliente', grupo: 'ident', tipo: 'texto_voz', rotulo: 'Nome do cliente', exemplo: 'Ex.: Valdemir Rossini', max: 30 },
-    { key: 'fazenda', grupo: 'ident', tipo: 'texto_voz', rotulo: 'Fazenda', exemplo: 'Ex.: Fazenda Samambaia', max: 30 },
+    // identificação (só "Novo negócio"): cliente e fazenda só digitados; município digitado OU por voz; telefone sempre digitado e opcional
+    { key: 'cliente', grupo: 'ident', tipo: 'texto', rotulo: 'Nome do cliente', exemplo: 'Ex.: Valdemir Rossini', obrigatorio: true },
+    { key: 'fazenda', grupo: 'ident', tipo: 'texto', rotulo: 'Fazenda', exemplo: 'Ex.: Fazenda Samambaia' },
     { key: 'municipio', grupo: 'ident', tipo: 'texto_voz', rotulo: 'Município', exemplo: 'Ex.: Batayporã', max: 30 },
     { key: 'telefone', grupo: 'ident', tipo: 'telefone', rotulo: 'Telefone (opcional)', exemplo: 'Ex.: (67) 99999-0000' },
     // relatório da visita
     { key: 'assunto', grupo: 'relatorio', tipo: 'voz', rotulo: 'O que foi tratado na visita', exemplo: 'Ex.: Apresentei o projeto de 6 pivôs; o cliente quer ajustar o valor', obrigatorio: true, max: 180 },
     { key: 'etapa', grupo: 'relatorio', tipo: 'opcoes', rotulo: 'Etapa do funil', opcoes: ETAPAS },
-    // condicional: só aparece com etapa Ganho/Perdido (fica logo abaixo da etapa)
-    { key: 'motivo', grupo: 'relatorio', tipo: 'opcoes', rotulo: 'Motivo', condicional: true, mostrarSe: { key: 'etapa', em: ['GANHO', 'PERDIDO'] } },
+    // condicional: só aparece com etapa Ganho, Perdido ou Prospecção descartada (fica logo abaixo da etapa)
+    { key: 'motivo', grupo: 'relatorio', tipo: 'opcoes', rotulo: 'Motivo', condicional: true, mostrarSe: { key: 'etapa', em: ['GANHO', 'PERDIDO', ETAPA_DESCARTADA] } },
     { key: 'probabilidade', grupo: 'relatorio', tipo: 'estrelas', rotulo: 'Probabilidade de compra' },
     { key: 'previsao_compra', grupo: 'relatorio', tipo: 'mes', rotulo: 'Previsão de compra' },
     { key: 'concorrente', grupo: 'relatorio', tipo: 'sim_nao', rotulo: 'Tem concorrente?' },
@@ -57,18 +64,21 @@
     // opcionais
     { key: 'segmentacao', grupo: 'opcional', tipo: 'multi', rotulo: 'Segmentação do cliente', opcoes: asOpcoes(SEGMENTOS) },
     { key: 'origem', grupo: 'opcional', tipo: 'opcoes', rotulo: 'Origem do contato', opcoes: asOpcoes(ORIGENS) },
-    { key: 'est_pivos', grupo: 'opcional', tipo: 'voz', numero: true, rotulo: 'Nº de pivôs (estimativa)', exemplo: 'Diga só o número. Ex.: seis', max: 15 },
-    { key: 'est_hectares', grupo: 'opcional', tipo: 'voz', numero: true, rotulo: 'Hectares (estimativa)', exemplo: 'Diga só o número. Ex.: quatrocentos e cinquenta', max: 15 },
+    // legado (1.3.0): estimativas que saíram do formulário; o que já foi registrado continua aparecendo na ficha e no histórico
+    { key: 'est_pivos', grupo: 'legado', tipo: 'voz', numero: true, rotulo: 'Nº de pivôs (estimativa)', exemplo: 'Diga só o número. Ex.: seis', max: 15 },
+    { key: 'est_hectares', grupo: 'legado', tipo: 'voz', numero: true, rotulo: 'Hectares (estimativa)', exemplo: 'Diga só o número. Ex.: quatrocentos e cinquenta', max: 15 },
   ];
 
   const campoPorChave = (k) => CAMPOS.find((c) => c.key === k);
   const camposAudio = () => CAMPOS.filter((c) => c.tipo === 'voz' || c.tipo === 'texto_voz').map((c) => c.key);
 
+  /** Motivos válidos para a etapa (lista de valores) ou null quando a etapa não tem motivo. */
+  function motivosDaEtapa(etapa) {
+    return etapa === 'GANHO' ? MOTIVOS_GANHO : etapa === 'PERDIDO' ? MOTIVOS_PERDA : etapa === ETAPA_DESCARTADA ? MOTIVOS_DESCARTE : null;
+  }
+
   function opcoesDoCampo(def, valores) {
-    if (def.key === 'motivo') {
-      const etapa = valores && valores.etapa;
-      return asOpcoes(etapa === 'GANHO' ? MOTIVOS_GANHO : etapa === 'PERDIDO' ? MOTIVOS_PERDA : []);
-    }
+    if (def.key === 'motivo') return asOpcoes(motivosDaEtapa(valores && valores.etapa) || []);
     return def.opcoes || [];
   }
 
@@ -139,7 +149,7 @@
     return String(s == null ? '' : s).replace(/[^\d()+\-\s.]/g, '').replace(/\s+/g, ' ').trim();
   }
 
-  /* ---------- lançamento do escritório: data (e hora, opcional) real da visita ---------- */
+  /* ---------- data real da visita (registros antigos lançados pelo escritório no app, até a 1.2.0) ---------- */
   /** "2026-11-24" + "15:40" → { iso, semHora:false }. Sem hora → meio-dia local, semHora:true. Data inválida → null. */
   function dataHoraVisita(dataStr, horaStr) {
     const md = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dataStr || ''));
@@ -151,7 +161,7 @@
     return { iso: d.toISOString(), semHora: semHora, data: d };
   }
 
-  /** Quando a visita aconteceu (para ordenar): data real informada no lançamento do escritório, senão a hora do salvamento. */
+  /** Quando a visita aconteceu (para ordenar): data real informada num lançamento antigo do escritório, senão a hora do salvamento. */
   const quandoDoRegistro = (r) => r.dataVisita || r.criadoEm;
 
   /* ---------- regra "a última visita sobrepõe; sem alteração mantém" ---------- */
@@ -198,20 +208,23 @@
     return base + (n.municipio ? ' (' + n.municipio + ')' : '');
   }
 
-  /* ---------- validação: só 3 itens são obrigatórios (no lançamento do escritório, mais a data e o vendedor) ---------- */
-  function validarRegistro(d, hoje) {
+  /* ---------- validação ----------
+   * Obrigatórios: o negócio (e o nome do cliente, se for novo), o que foi tratado e a próxima ação (por voz).
+   * Prospecção descartada: exige o motivo do descarte e dispensa a próxima ação (não há próximo passo).
+   * d.valores = valores efetivos do negócio (o que já está nele + o que foi tocado agora); d.etapaTocada = a etapa foi escolhida NESTA visita
+   * (padrão: sim). A etapa já gravada no negócio não trava uma visita nova. */
+  function validarRegistro(d) {
     const erros = [];
+    const v = d.valores || {};
     const textoCliente = d.texto && d.texto.cliente && d.texto.cliente.trim();
-    if (!d.negocioSel) erros.push('Escolha o negócio ou "Novo prospect".');
-    else if (d.negocioSel === 'NOVO' && !textoCliente && !(d.audios && d.audios.cliente)) erros.push('Informe o nome do cliente (digitado ou por voz).');
+    const descarte = v.etapa === ETAPA_DESCARTADA && d.etapaTocada !== false;
+    if (!d.negocioSel) erros.push('Escolha o negócio ou "Novo negócio".');
+    else if (d.negocioSel === 'NOVO' && !textoCliente) erros.push('Digite o nome do cliente.');
     if (!(d.audios && d.audios.assunto)) erros.push('Grave o que foi tratado na visita.');
-    if (!(d.audios && d.audios.proxima_acao)) erros.push('Grave a próxima ação.');
-    if (d.modo === 'escritorio') {
-      if (!String(d.lancandoEm || '').trim()) erros.push('Informe em nome de qual vendedor está lançando.');
-      const dh = dataHoraVisita(d.dataVisita, d.horaVisita);
-      if (!dh) erros.push('Informe a data em que a visita aconteceu.');
-      else if (dh.data.getTime() > (hoje || new Date()).getTime() + 24 * 3600 * 1000) erros.push('A data da visita está no futuro.');
-    }
+    if (descarte) {
+      if (!v.motivo) erros.push('Escolha o motivo do descarte da prospecção.');
+      else if (MOTIVOS_DESCARTE.indexOf(v.motivo) < 0) erros.push('O motivo escolhido não combina com "Prospecção descartada".');
+    } else if (!(d.audios && d.audios.proxima_acao)) erros.push('Grave a próxima ação.');
     return erros;
   }
 
@@ -289,6 +302,9 @@
     if (reg && reg.status === 'enviando') return { codigo: 'enviando', texto: 'Enviando…', tom: 'atencao' };
     return { codigo: 'aguardando_envio', texto: 'Aguardando envio', tom: 'atencao' };
   }
+
+  /** Só se exclui o que o escritório ainda não recebeu: registro salvo no aparelho e não transmitido (nem em transmissão). */
+  const podeExcluirRegistro = (reg) => !!reg && reg.status === 'pendente';
 
   /** Áudio/PDF só saem do aparelho depois de: enviado + Liberada + o texto de CADA áudio já voltou (+ PDF copiado). */
   function podeLimparArquivos(reg, sv) {
@@ -376,13 +392,58 @@
     .filter((x) => x.estado)
     .sort((a, b) => String(a.n.campos.proxima_acao_data).localeCompare(String(b.n.campos.proxima_acao_data)));
 
+  /* =====================================================================
+   * v1.3.0 — avisos de alteração: quando o escritório/administrador altera algo do negócio do vendedor,
+   * o celular mostra o aviso até o vendedor dar "Ciente" (a ciência fica só neste aparelho).
+   * ===================================================================== */
+  const ROTULO_ACAO_AVISO = {
+    'editou visita': 'editou uma visita',
+    'lançou visita': 'lançou uma visita em seu nome',
+    'anexou PDF': 'anexou o PDF do projeto',
+    'rejeitou visita': 'rejeitou uma visita',
+    'excluiu visita': 'excluiu uma visita',
+    'corrigiu identificação': 'corrigiu a identificação do negócio',
+  };
+
+  /** Avisos que o vendedor ainda não deu ciência, do mais novo para o mais antigo. vistos = { idDoAviso: true }. */
+  function avisosPendentes(avisos, vistos) {
+    vistos = vistos || {};
+    return (Array.isArray(avisos) ? avisos : [])
+      .filter((a) => a && a.id && !vistos[a.id])
+      .sort((a, b) => (Date.parse(b.quando) || 0) - (Date.parse(a.quando) || 0));
+  }
+
+  /** Avisos que dizem respeito a um negócio do aparelho (casa pelo id oficial, pelo provisório ou pelas visitas dele). */
+  function avisosDoNegocio(avisos, n) {
+    if (!n) return [];
+    const ids = {};
+    ids[n.id] = true;
+    (n.regs || []).forEach((r) => { if (r.negocioId) ids[r.negocioId] = true; });
+    return avisos.filter((a) => ids[a.negocio] || (Array.isArray(a.ids) && a.ids.some((i) => ids[i])));
+  }
+
+  /** "25/11/2026 10:34" no fuso do aparelho, a partir do instante ISO do aviso. */
+  function quandoAviso(iso) {
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return '';
+    return dois(d.getDate()) + '/' + dois(d.getMonth() + 1) + '/' + d.getFullYear() + ' ' + dois(d.getHours()) + ':' + dois(d.getMinutes());
+  }
+
+  /** { titulo, quando, detalhe } para mostrar. */
+  function textoAviso(a) {
+    const quem = a && a.por === 'Administrador' ? 'O administrador' : 'O escritório';
+    const acao = ROTULO_ACAO_AVISO[a && a.acao] || String((a && a.acao) || 'alterou o negócio');
+    return { titulo: quem + ' ' + acao, quando: quandoAviso(a && a.quando), detalhe: String((a && a.resumo) || '') };
+  }
+
   return {
-    APP_VERSAO, CAMPOS, ETAPAS, MOTIVOS_GANHO, MOTIVOS_PERDA, ORIGENS, SEGMENTOS, TIPOS_SISTEMA,
-    campoPorChave, camposAudio, opcoesDoCampo, campoVisivel, contarCampos,
+    APP_VERSAO, CAMPOS, ETAPAS, ETAPA_PROSPECCAO, ETAPA_DESCARTADA, MOTIVOS_GANHO, MOTIVOS_PERDA, MOTIVOS_DESCARTE, ORIGENS, SEGMENTOS, TIPOS_SISTEMA,
+    campoPorChave, camposAudio, motivosDaEtapa, opcoesDoCampo, campoVisivel, contarCampos,
     sanitizeNome, fmtDataCurta, fmtHora, nomeRelatorio, gerarCodigoProvisorio, gerarId, extPorMime,
     limparTelefone, dataHoraVisita, quandoDoRegistro,
     mesclarCampos, listaNegocios, rotuloNegocio, validarRegistro, fmtDur, fmtBytes,
     semAcento, mesmoVendedor, hojeIso, acaoVencida, parseQuando, fmtDataBR, fmtQuando, fmtNum, fmtReais, valorPorHa, temValorProjeto, mapaLink, rotuloEtapa, textoCampo,
-    statusVisita, podeLimparArquivos, unirNegocios, filtrarNegocios, municipiosDisponiveis, etapasDisponiveis, acoesVencidas,
+    statusVisita, podeExcluirRegistro, podeLimparArquivos, unirNegocios, filtrarNegocios, municipiosDisponiveis, etapasDisponiveis, acoesVencidas,
+    avisosPendentes, avisosDoNegocio, quandoAviso, textoAviso,
   };
 });
