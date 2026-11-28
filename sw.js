@@ -1,6 +1,6 @@
 /* sw.js — deixa o app abrir sem sinal (guarda os arquivos do app no aparelho).
  * A cada mudança no app, troque a VERSAO abaixo: é isso que faz o celular baixar os arquivos novos. */
-const VERSAO = 'crm-copasul-1.2.0';
+const VERSAO = 'crm-copasul-1.3.0';
 const ARQUIVOS = ['./', './index.html', './style.css', './logic.js', './app.js', './manifest.webmanifest', './icons/icon-192.png', './icons/icon-512.png'];
 
 self.addEventListener('install', (e) => {
